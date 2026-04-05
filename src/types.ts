@@ -171,7 +171,7 @@ export interface E2EEKeyUpdatePayload {
 export interface CommandParameter {
   name: string;
   description: string;
-  type: 'string' | 'number' | 'boolean';
+  type: 'string' | 'integer' | 'boolean' | 'user' | 'channel' | 'role';
   required?: boolean;
 }
 
