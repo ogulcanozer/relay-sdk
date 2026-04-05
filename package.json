@@ -1,0 +1,50 @@
+{
+  "name": "@relay/sdk",
+  "version": "1.0.0",
+  "description": "Relay Bot SDK — typed client for building Relay bots",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./voice": {
+      "types": "./dist/voice/index.d.ts",
+      "import": "./dist/voice/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "pnpm build"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.7.0"
+  },
+  "peerDependencies": {
+    "@discordjs/opus": ">=0.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@discordjs/opus": {
+      "optional": true
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ogulcanozer/relay-sdk.git"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
