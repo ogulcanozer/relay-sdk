@@ -187,6 +187,79 @@ export interface CommandDefinition {
   cooldownSeconds?: number;
 }
 
+// ─── REST Response Types ─────────────────────────────────────────────
+
+export interface ServerResponse {
+  id: string;
+  name: string;
+  iconUrl: string | null;
+  ownerId: string;
+  inviteCode: string;
+  isPublicRoom: boolean;
+  memberCount: number;
+  channels: ChannelResponse[];
+}
+
+export interface ChannelResponse {
+  id: string;
+  serverId: string;
+  name: string;
+  type: 'text' | 'voice';
+  topic: string | null;
+  position: number;
+}
+
+export interface MemberResponse {
+  userId: string;
+  username: string;
+  discriminator: string;
+  displayName: string | null;
+  avatarUrl: string | null;
+  isBot: boolean;
+  joinedAt: string;
+  roles: string[];
+}
+
+export interface RoleResponse {
+  id: string;
+  name: string;
+  color: string | null;
+  position: number;
+  permissions: string;
+  isDefault: boolean;
+}
+
+export interface UserResponse {
+  id: string;
+  username: string;
+  discriminator: string;
+  displayName: string | null;
+  avatarUrl: string | null;
+  status: string;
+  customStatus: string | null;
+  isBot: boolean;
+  deleted?: boolean;
+}
+
+export interface MessageResponse {
+  id: string;
+  channelId: string;
+  content: string;
+  authorId: string;
+  type: string;
+  metadata: Record<string, unknown> | null;
+  createdAt: string;
+  editedAt: string | null;
+  author: {
+    id: string;
+    username: string;
+    discriminator: string;
+    displayName: string | null;
+    avatarUrl: string | null;
+    isBot: boolean;
+  };
+}
+
 // ─── Client Events (typed emitter) ──────────────────────────────────
 
 export type ClientEvents = {

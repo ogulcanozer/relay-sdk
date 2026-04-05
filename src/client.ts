@@ -7,13 +7,18 @@
  *   client.on('commandInteraction', interaction => { ... });
  *   await client.login();
  *
- * Clean API surface — full SDK expansion (caching, command framework,
- * rate limits, sharding) is purely additive.
+ * Provides:
+ * - Typed event emitter for gateway events
+ * - REST client for API calls (rate limited, retried, circuit-broken)
+ * - In-memory cache populated from gateway events and REST responses
+ * - Voice connection management
+ * - Slash command registration and built-in /commands handler
  */
 
 import { TypedEmitter } from './event-emitter.js';
 import { Gateway } from './gateway.js';
 import { RESTClient } from './rest.js';
+import { Cache } from './cache.js';
 import { VoiceConnection } from './voice/connection.js';
 import type {
   ClientEvents,
@@ -22,7 +27,12 @@ import type {
   BotUser,
   CommandInteraction,
   MessagePayload,
-  VoiceStateUpdatePayload,
+  MessageResponse,
+  ServerResponse,
+  ChannelResponse,
+  MemberResponse,
+  RoleResponse,
+  UserResponse,
   MemberJoinPayload,
   MemberLeavePayload,
   VoiceReadyPayload,
@@ -43,6 +53,12 @@ export interface BotClientOptions {
   wsUrl: string;
   /** Gateway intents bitmask (default: COMMAND_INTERACTIONS | VOICE_STATES) */
   intents?: number;
+  /** Max retries on 5xx / network errors. Default: 3 */
+  maxRetries?: number;
+  /** Request timeout in ms. Default: 15000 */
+  timeout?: number;
+  /** Debug logger callback. Also receives gateway and cache debug messages. */
+  debug?: (msg: string) => void;
 }
 
 /** Intent flags for bot event filtering. */
@@ -75,21 +91,32 @@ const EVENT_MAP: Record<string, keyof ClientEvents> = {
 export class BotClient extends TypedEmitter<ClientEvents> {
   readonly rest: RESTClient;
   readonly gateway: Gateway;
+  readonly cache: Cache;
 
   private _user: BotUser | null = null;
   private _serverIds: string[] = [];
   private _registeredCommands: CommandDefinition[] = [];
   private voice: VoiceConnection | null = null;
+  private readonly debugFn: ((msg: string) => void) | null;
 
   constructor(options: BotClientOptions) {
     super();
 
     const intents = options.intents ?? (Intents.COMMAND_INTERACTIONS | Intents.VOICE_STATES);
+    this.debugFn = options.debug ?? null;
 
     this.rest = new RESTClient({
       apiUrl: options.apiUrl,
       token: options.token,
+      maxRetries: options.maxRetries,
+      timeout: options.timeout,
+      debug: options.debug,
     });
+
+    this.cache = new Cache(
+      this.rest,
+      (msg) => this.emit('debug', msg),
+    );
 
     this.gateway = new Gateway({
       wsUrl: options.wsUrl,
@@ -130,6 +157,7 @@ export class BotClient extends TypedEmitter<ClientEvents> {
   async destroy(): Promise<void> {
     await this.leaveVoice();
     this.gateway.disconnect();
+    this.cache.clear();
     this._user = null;
     this._serverIds = [];
     this.removeAllListeners();
@@ -196,9 +224,58 @@ export class BotClient extends TypedEmitter<ClientEvents> {
 
   // ─── Messages ────────────────────────────────────────────────────
 
-  /** Send a message to a server channel. */
-  async sendMessage(channelId: string, serverId: string, content: string): Promise<unknown> {
-    return this.rest.sendMessage(channelId, serverId, content);
+  /** Send a message to a channel. Auto-generates nonce if not provided. */
+  async sendMessage(
+    channelId: string,
+    content: string,
+    opts?: { nonce?: string },
+  ): Promise<MessageResponse> {
+    return this.rest.sendMessage(channelId, content, opts);
+  }
+
+  /** Edit a message by ID. */
+  async editMessage(messageId: string, content: string): Promise<void> {
+    return this.rest.editMessage(messageId, content);
+  }
+
+  /** Delete a message by ID. */
+  async deleteMessage(messageId: string): Promise<void> {
+    return this.rest.deleteMessage(messageId);
+  }
+
+  /** Fetch messages from a channel. */
+  async getMessages(
+    channelId: string,
+    opts?: { before?: string; limit?: number },
+  ): Promise<MessageResponse[]> {
+    return this.rest.listMessages(channelId, opts);
+  }
+
+  // ─── Server Info (via cache) ─────────────────────────────────────
+
+  /** Get server info. Cached for 30 minutes. */
+  async getServer(serverId: string): Promise<ServerResponse> {
+    return this.cache.getServer(serverId);
+  }
+
+  /** Get all members of a server. Cached for 5 minutes. */
+  async getMembers(serverId: string): Promise<MemberResponse[]> {
+    return this.cache.getMembers(serverId);
+  }
+
+  /** Get all channels of a server. Cached for 30 minutes. */
+  async getChannels(serverId: string): Promise<ChannelResponse[]> {
+    return this.cache.getChannels(serverId);
+  }
+
+  /** Get all roles of a server. Cached for 5 minutes. */
+  async getRoles(serverId: string): Promise<RoleResponse[]> {
+    return this.cache.getRoles(serverId);
+  }
+
+  /** Get a user by ID. Cached for 5 minutes. */
+  async getUser(userId: string): Promise<UserResponse> {
+    return this.cache.getUser(userId);
   }
 
   // ─── Internal ────────────────────────────────────────────────────
@@ -217,12 +294,23 @@ export class BotClient extends TypedEmitter<ClientEvents> {
       if (payload.user?.id === this._user?.id && !this._serverIds.includes(payload.serverId)) {
         this._serverIds.push(payload.serverId);
       }
+      this.cache.handleMemberJoin(payload);
     }
     if (event === 'MEMBER_LEAVE') {
       const payload = data as MemberLeavePayload;
       if (payload.userId === this._user?.id) {
         this._serverIds = this._serverIds.filter(id => id !== payload.serverId);
       }
+      this.cache.handleMemberLeave(payload);
+    }
+
+    // Populate cache from gateway events
+    if (event === 'MESSAGE_CREATE') {
+      this.cache.handleMessageCreate(data as MessagePayload);
+    }
+    if (event === 'PRESENCE_UPDATE') {
+      const payload = data as { userId: string; status: string };
+      this.cache.handlePresenceUpdate(payload);
     }
 
     // Route voice events to VoiceConnection
