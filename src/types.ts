@@ -181,6 +181,10 @@ export interface CommandDefinition {
   name: string;
   description: string;
   parameters?: CommandParameter[];
+  /** Permission key name required to use this command (e.g. 'MANAGE_MESSAGES'). Null = anyone. */
+  defaultPermission?: string;
+  /** Per-user cooldown in seconds between uses. */
+  cooldownSeconds?: number;
 }
 
 // ─── Client Events (typed emitter) ──────────────────────────────────

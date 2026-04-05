@@ -202,6 +202,20 @@ export class BotClient extends TypedEmitter<ClientEvents> {
       this._serverIds = payload.serverIds;
     }
 
+    // Track serverIds on mid-session membership changes
+    if (event === 'MEMBER_JOIN') {
+      const payload = data as MemberJoinPayload;
+      if (payload.user?.id === this._user?.id && !this._serverIds.includes(payload.serverId)) {
+        this._serverIds.push(payload.serverId);
+      }
+    }
+    if (event === 'MEMBER_LEAVE') {
+      const payload = data as MemberLeavePayload;
+      if (payload.userId === this._user?.id) {
+        this._serverIds = this._serverIds.filter(id => id !== payload.serverId);
+      }
+    }
+
     // Route voice events to VoiceConnection
     if (this.voice) {
       switch (event) {
