@@ -11,6 +11,7 @@ export type {
   CommandParameter,
   CommandInteraction,
   ReadyPayload,
+  BotUser,
   MessagePayload,
   VoiceStateUpdatePayload,
   MemberJoinPayload,

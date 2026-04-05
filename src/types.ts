@@ -38,19 +38,21 @@ export interface WSMessage {
 
 // ─── Gateway Events ──────────────────────────────────────────────────
 
+export interface BotUser {
+  id: string;
+  username: string;
+  discriminator: string;
+  displayName: string | null;
+  avatarUrl: string | null;
+  isBot: boolean;
+}
+
 export interface ReadyPayload {
   userId: string;
   sessionId: string;
   serverIds: string[];
   heartbeatInterval: number;
-  user: {
-    id: string;
-    username: string;
-    discriminator: string;
-    displayName: string | null;
-    avatarUrl: string | null;
-    isBot: boolean;
-  };
+  user?: BotUser | null;
 }
 
 export interface CommandInteraction {

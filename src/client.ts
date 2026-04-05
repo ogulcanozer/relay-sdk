@@ -19,6 +19,7 @@ import type {
   ClientEvents,
   CommandDefinition,
   ReadyPayload,
+  BotUser,
   CommandInteraction,
   MessagePayload,
   VoiceStateUpdatePayload,
@@ -75,7 +76,7 @@ export class BotClient extends TypedEmitter<ClientEvents> {
   readonly rest: RESTClient;
   readonly gateway: Gateway;
 
-  private _user: ReadyPayload['user'] | null = null;
+  private _user: BotUser | null = null;
   private _serverIds: string[] = [];
   private voice: VoiceConnection | null = null;
 
@@ -104,7 +105,7 @@ export class BotClient extends TypedEmitter<ClientEvents> {
   }
 
   /** The bot's user identity (available after login). */
-  get user(): ReadyPayload['user'] | null { return this._user; }
+  get user(): BotUser | null { return this._user; }
 
   /** Server IDs the bot is a member of (available after login). */
   get serverIds(): string[] { return this._serverIds; }
@@ -120,7 +121,7 @@ export class BotClient extends TypedEmitter<ClientEvents> {
   /** Connect to the gateway. Resolves when READY is received. */
   async login(): Promise<void> {
     const ready = await this.gateway.connect();
-    this._user = ready.user;
+    this._user = ready.user ?? null;
     this._serverIds = ready.serverIds;
   }
 
