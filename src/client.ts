@@ -195,6 +195,13 @@ export class BotClient extends TypedEmitter<ClientEvents> {
   // ─── Internal ────────────────────────────────────────────────────
 
   private handleDispatch(event: string, data: unknown): void {
+    // Update user/server state on every READY (including reconnects)
+    if (event === 'READY') {
+      const payload = data as ReadyPayload;
+      this._user = payload.user ?? null;
+      this._serverIds = payload.serverIds;
+    }
+
     // Route voice events to VoiceConnection
     if (this.voice) {
       switch (event) {
