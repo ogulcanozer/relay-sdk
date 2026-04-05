@@ -78,6 +78,7 @@ export class BotClient extends TypedEmitter<ClientEvents> {
 
   private _user: BotUser | null = null;
   private _serverIds: string[] = [];
+  private _registeredCommands: CommandDefinition[] = [];
   private voice: VoiceConnection | null = null;
 
   constructor(options: BotClientOptions) {
@@ -136,9 +137,17 @@ export class BotClient extends TypedEmitter<ClientEvents> {
 
   // ─── Commands ────────────────────────────────────────────────────
 
-  /** Register slash commands with the API server. Full sync — replaces all existing. */
+  /** Register slash commands with the API server. Full sync — replaces all existing. Auto-appends /commands. */
   async registerCommands(commands: CommandDefinition[]): Promise<number> {
-    return this.rest.registerCommands(commands);
+    this._registeredCommands = commands;
+
+    // Auto-inject /commands if the bot hasn't defined it
+    const hasCommands = commands.some((c) => c.name === 'commands');
+    const toRegister = hasCommands
+      ? commands
+      : [...commands, { name: 'commands', description: 'List all commands for this bot' }];
+
+    return this.rest.registerCommands(toRegister);
   }
 
   /** Reply to a command interaction. */
@@ -243,12 +252,45 @@ export class BotClient extends TypedEmitter<ClientEvents> {
       }
     }
 
+    // Intercept built-in /commands before emitting to user handlers
+    if (event === 'COMMAND_INTERACTION') {
+      const interaction = data as CommandInteraction;
+      if (interaction.commandName === 'commands' && !this._registeredCommands.some((c) => c.name === 'commands')) {
+        this.handleBuiltinCommands(interaction);
+        return;
+      }
+    }
+
     // Emit typed events
     const mapped = EVENT_MAP[event];
     if (mapped) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       this.emit(mapped, data as any);
     }
+  }
+
+  private handleBuiltinCommands(interaction: CommandInteraction): void {
+    const cmds = this._registeredCommands;
+    if (cmds.length === 0) {
+      this.reply(interaction, 'This bot has no commands registered.');
+      return;
+    }
+
+    const botName = this._user?.displayName ?? this._user?.username ?? 'Bot';
+    const lines: string[] = [`**${botName} Commands**`, ''];
+
+    for (const cmd of cmds) {
+      const params = (cmd.parameters ?? [])
+        .map((p) => (p.required !== false ? `<${p.name}>` : `[${p.name}]`))
+        .join(' ');
+
+      const access = cmd.defaultAccess === 'owner_only' ? ' `owner`' : '';
+      const cooldown = cmd.cooldownSeconds ? ` \`${cmd.cooldownSeconds}s cd\`` : '';
+
+      lines.push(`\`/${cmd.name}\`${params ? ' ' + params : ''} — ${cmd.description}${access}${cooldown}`);
+    }
+
+    this.reply(interaction, lines.join('\n'));
   }
 
   private handleLifecycle(type: 'connected' | 'disconnected' | 'reconnecting', attempt?: number): void {
