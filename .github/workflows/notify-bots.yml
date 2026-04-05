@@ -1,0 +1,16 @@
+name: Notify relay-bot on SDK change
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  trigger-bot-rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger relay-bot deploy
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.BOT_REPO_PAT }}
+          repository: ogulcanozer/relay-bot
+          event-type: sdk-updated
