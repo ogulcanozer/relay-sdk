@@ -22,7 +22,7 @@
     "build": "tsc",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "pnpm build"
+    "prepare": "tsc"
   },
   "dependencies": {
     "ws": "^8.18.0"
