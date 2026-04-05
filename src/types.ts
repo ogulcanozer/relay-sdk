@@ -181,8 +181,8 @@ export interface CommandDefinition {
   name: string;
   description: string;
   parameters?: CommandParameter[];
-  /** Permission key name required to use this command (e.g. 'MANAGE_MESSAGES'). Null = anyone. */
-  defaultPermission?: string;
+  /** Access level: 'everyone' (default) or 'owner_only'. Server admins can override with role-based access. */
+  defaultAccess?: 'everyone' | 'owner_only';
   /** Per-user cooldown in seconds between uses. */
   cooldownSeconds?: number;
 }
