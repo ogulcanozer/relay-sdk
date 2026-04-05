@@ -284,7 +284,7 @@ export class BotClient extends TypedEmitter<ClientEvents> {
         .map((p) => (p.required !== false ? `<${p.name}>` : `[${p.name}]`))
         .join(' ');
 
-      const access = cmd.defaultAccess === 'owner_only' ? ' `owner`' : '';
+      const access = cmd.defaultAccess === 'admin_only' ? ' `admin`' : '';
       const cooldown = cmd.cooldownSeconds ? ` \`${cmd.cooldownSeconds}s cd\`` : '';
 
       lines.push(`\`/${cmd.name}\`${params ? ' ' + params : ''} — ${cmd.description}${access}${cooldown}`);

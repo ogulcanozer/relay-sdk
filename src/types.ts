@@ -181,8 +181,8 @@ export interface CommandDefinition {
   name: string;
   description: string;
   parameters?: CommandParameter[];
-  /** Access level: 'everyone' (default) or 'owner_only'. Server admins can override with role-based access. */
-  defaultAccess?: 'everyone' | 'owner_only';
+  /** Access level: 'everyone' (default) or 'admin_only'. Server admins can override with role-based access. */
+  defaultAccess?: 'everyone' | 'admin_only';
   /** Per-user cooldown in seconds between uses. */
   cooldownSeconds?: number;
 }
