@@ -346,6 +346,7 @@ export type ClientEvents = {
   memberJoin: [payload: MemberJoinPayload];
   memberLeave: [payload: MemberLeavePayload];
   componentInteraction: [ComponentInteraction];
+  serverDelete: [payload: { serverId: string }];
 
   // Voice pipeline events (internal, exposed for advanced use)
   voiceReady: [payload: VoiceReadyPayload];

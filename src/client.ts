@@ -90,6 +90,7 @@ const EVENT_MAP: Record<string, keyof ClientEvents> = {
   VOICE_PRODUCER_CLOSED: 'producerClosed',
   E2EE_KEY_UPDATE: 'e2eeKeyUpdate',
   COMPONENT_INTERACTION: 'componentInteraction',
+  SERVER_DELETE: 'serverDelete',
 };
 
 export class BotClient extends TypedEmitter<ClientEvents> {
@@ -320,6 +321,12 @@ export class BotClient extends TypedEmitter<ClientEvents> {
         this._serverIds = this._serverIds.filter(id => id !== payload.serverId);
       }
       this.cache.handleMemberLeave(payload);
+    }
+
+    // Track server deletions
+    if (event === 'SERVER_DELETE') {
+      const payload = data as { serverId: string };
+      this._serverIds = this._serverIds.filter(id => id !== payload.serverId);
     }
 
     // Populate cache from gateway events
