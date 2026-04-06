@@ -23,6 +23,9 @@ import { VoiceConnection } from './voice/connection.js';
 import type {
   ClientEvents,
   CommandDefinition,
+  Embed,
+  ActionRow,
+  BotActivity,
   ReadyPayload,
   BotUser,
   CommandInteraction,
@@ -86,6 +89,7 @@ const EVENT_MAP: Record<string, keyof ClientEvents> = {
   NEW_PRODUCER: 'newProducer',
   VOICE_PRODUCER_CLOSED: 'producerClosed',
   E2EE_KEY_UPDATE: 'e2eeKeyUpdate',
+  COMPONENT_INTERACTION: 'componentInteraction',
 };
 
 export class BotClient extends TypedEmitter<ClientEvents> {
@@ -179,12 +183,19 @@ export class BotClient extends TypedEmitter<ClientEvents> {
   }
 
   /** Reply to a command interaction. */
-  reply(interaction: CommandInteraction, content: string, ephemeral = false): void {
+  reply(interaction: CommandInteraction, content: string, ephemeral?: boolean): void;
+  reply(interaction: CommandInteraction, content: string, opts?: { ephemeral?: boolean; embeds?: Embed[]; components?: ActionRow[] }): void;
+  reply(interaction: CommandInteraction, content: string, optsOrEphemeral?: boolean | { ephemeral?: boolean; embeds?: Embed[]; components?: ActionRow[] }): void {
+    const ephemeral = typeof optsOrEphemeral === 'boolean' ? optsOrEphemeral : optsOrEphemeral?.ephemeral ?? false;
+    const embeds = typeof optsOrEphemeral === 'object' ? optsOrEphemeral?.embeds : undefined;
+    const components = typeof optsOrEphemeral === 'object' ? optsOrEphemeral?.components : undefined;
     this.gateway.sendInteractionResponse(
       interaction.interactionId,
       interaction.channelId,
       content,
       ephemeral,
+      embeds,
+      components,
     );
   }
 
@@ -228,7 +239,7 @@ export class BotClient extends TypedEmitter<ClientEvents> {
   async sendMessage(
     channelId: string,
     content: string,
-    opts?: { nonce?: string },
+    opts?: { nonce?: string; embeds?: Embed[]; components?: ActionRow[] },
   ): Promise<MessageResponse> {
     return this.rest.sendMessage(channelId, content, opts);
   }
@@ -276,6 +287,13 @@ export class BotClient extends TypedEmitter<ClientEvents> {
   /** Get a user by ID. Cached for 5 minutes. */
   async getUser(userId: string): Promise<UserResponse> {
     return this.cache.getUser(userId);
+  }
+
+  // ─── Activity ───────────────────────────────────────────────────
+
+  /** Set the bot's activity (presence). Pass null to clear. */
+  async setActivity(activity: BotActivity | null): Promise<void> {
+    return this.rest.updateActivity(activity);
   }
 
   // ─── Internal ────────────────────────────────────────────────────

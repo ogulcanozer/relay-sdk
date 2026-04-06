@@ -4,6 +4,8 @@ export { RESTClient, RESTError, type RESTOptions } from './rest.js';
 export { Gateway, type GatewayOptions } from './gateway.js';
 export { Cache } from './cache.js';
 export { TypedEmitter } from './event-emitter.js';
+export { EmbedBuilder } from './embed-builder.js';
+export { ActionRowBuilder, ButtonBuilder, SelectMenuBuilder } from './component-builder.js';
 
 // ─── Types ───────────────────────────────────────────────────────────
 export type {
@@ -11,6 +13,13 @@ export type {
   CommandDefinition,
   CommandParameter,
   CommandInteraction,
+  ComponentInteraction,
+  Embed,
+  ActionRow,
+  Button,
+  SelectMenu,
+  SelectOption,
+  BotActivity,
   ReadyPayload,
   BotUser,
   MessagePayload,

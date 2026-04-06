@@ -14,6 +14,9 @@
 
 import type {
   CommandDefinition,
+  Embed,
+  ActionRow,
+  BotActivity,
   MessageResponse,
   ServerResponse,
   ChannelResponse,
@@ -111,10 +114,16 @@ export class RESTClient {
   async sendMessage(
     channelId: string,
     content: string,
-    opts?: { nonce?: string },
+    opts?: { nonce?: string; embeds?: Embed[]; components?: ActionRow[] },
   ): Promise<MessageResponse> {
     const nonce = opts?.nonce ?? generateNonce();
-    return this.post<MessageResponse>('message.send', { channelId, content, nonce });
+    return this.post<MessageResponse>('message.send', {
+      channelId,
+      content,
+      nonce,
+      ...(opts?.embeds?.length ? { embeds: opts.embeds } : {}),
+      ...(opts?.components?.length ? { components: opts.components } : {}),
+    });
   }
 
   async editMessage(messageId: string, content: string): Promise<void> {
@@ -169,6 +178,12 @@ export class RESTClient {
 
   async getUser(userId: string): Promise<UserResponse> {
     return this.post<UserResponse>('user.getUser', { userId });
+  }
+
+  // ─── Activity ───────────────────────────────────────────────────
+
+  async updateActivity(activity: BotActivity | null): Promise<void> {
+    await this.post('user.updateActivity', { activity });
   }
 
   // ─── Commands ────────────────────────────────────────────────────

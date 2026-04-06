@@ -10,7 +10,7 @@
  */
 
 import WebSocket from 'ws';
-import { Op, type WSMessage, type ReadyPayload } from './types.js';
+import { Op, type WSMessage, type ReadyPayload, type Embed, type ActionRow } from './types.js';
 
 export interface GatewayOptions {
   wsUrl: string;
@@ -106,10 +106,18 @@ export class Gateway {
   }
 
   /** Send an interaction response. */
-  sendInteractionResponse(interactionId: string, channelId: string, content: string, ephemeral = false): void {
+  sendInteractionResponse(interactionId: string, channelId: string, content: string, ephemeral = false, embeds?: Embed[], components?: ActionRow[]): void {
     this.send({
       op: Op.INTERACTION_RESPONSE,
-      d: { interactionId, type: 'message', channelId, content, ephemeral },
+      d: {
+        interactionId,
+        type: 'message',
+        channelId,
+        content,
+        ephemeral,
+        ...(embeds?.length ? { embeds } : {}),
+        ...(components?.length ? { components } : {}),
+      },
     });
   }
 

@@ -27,6 +27,7 @@ export const Op = {
   INTERACTION_DEFER: 16,
   CALL_ACTION: 17,
   MEDIA_ACTION: 18,
+  COMPONENT_INTERACTION: 19,
 } as const;
 
 export interface WSMessage {
@@ -260,6 +261,79 @@ export interface MessageResponse {
   };
 }
 
+// ─── Components ─────────────────────────────────────────────────────
+
+export interface ActionRow {
+  type: 'actionRow';
+  components: (Button | SelectMenu)[];
+}
+
+export interface Button {
+  type: 'button';
+  style: 'primary' | 'secondary' | 'danger' | 'link';
+  label: string;
+  customId?: string;
+  url?: string;
+  disabled?: boolean;
+  emoji?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface SelectOption {
+  label: string;
+  value: string;
+  description?: string;
+  emoji?: string;
+  default?: boolean;
+}
+
+export interface SelectMenu {
+  type: 'select';
+  customId: string;
+  placeholder?: string;
+  minValues?: number;
+  maxValues?: number;
+  disabled?: boolean;
+  options: SelectOption[];
+  metadata?: Record<string, unknown>;
+}
+
+export interface ComponentInteraction {
+  type: 'component';
+  interactionId: string;
+  messageId: string;
+  channelId?: string;
+  serverId?: string;
+  userId: string;
+  customId: string;
+  componentType: 'button' | 'select';
+  values?: string[];
+  metadata?: Record<string, unknown>;
+}
+
+// ─── Embeds ─────────────────────────────────────────────────────────
+
+export interface Embed {
+  title?: string;
+  description?: string;
+  url?: string;
+  color?: string;
+  timestamp?: string;
+  footer?: { text: string; iconUrl?: string };
+  author?: { name: string; url?: string; iconUrl?: string };
+  thumbnail?: { url: string; width?: number; height?: number };
+  image?: { url: string; width?: number; height?: number };
+  fields?: Array<{ name: string; value: string; inline?: boolean }>;
+}
+
+// ─── Bot Activity ───────────────────────────────────────────────────
+
+export interface BotActivity {
+  type: 'playing' | 'listening' | 'watching' | 'streaming' | 'custom';
+  name: string;
+  url?: string;
+}
+
 // ─── Client Events (typed emitter) ──────────────────────────────────
 
 export type ClientEvents = {
@@ -271,6 +345,7 @@ export type ClientEvents = {
   voiceStateUpdate: [payload: VoiceStateUpdatePayload];
   memberJoin: [payload: MemberJoinPayload];
   memberLeave: [payload: MemberLeavePayload];
+  componentInteraction: [ComponentInteraction];
 
   // Voice pipeline events (internal, exposed for advanced use)
   voiceReady: [payload: VoiceReadyPayload];
