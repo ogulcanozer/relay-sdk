@@ -303,8 +303,20 @@ export class BotClient extends TypedEmitter<ClientEvents> {
     // Update user/server state on every READY (including reconnects)
     if (event === 'READY') {
       const payload = data as ReadyPayload;
+      const previousServerIds = this._serverIds;
       this._user = payload.user ?? null;
       this._serverIds = payload.serverIds;
+
+      // Detect servers the bot was removed from during disconnect
+      // Emit synthetic serverDelete for each so handlers can clean up
+      if (previousServerIds.length > 0) {
+        const newSet = new Set(payload.serverIds);
+        for (const oldId of previousServerIds) {
+          if (!newSet.has(oldId)) {
+            this.emit('serverDelete', { serverId: oldId });
+          }
+        }
+      }
     }
 
     // Track serverIds on mid-session membership changes
