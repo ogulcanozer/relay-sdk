@@ -6,6 +6,7 @@ export { Cache } from './cache.js';
 export { TypedEmitter } from './event-emitter.js';
 export { EmbedBuilder } from './embed-builder.js';
 export { ActionRowBuilder, ButtonBuilder, SelectMenuBuilder } from './component-builder.js';
+export { CommandRouter, SlashCommand, CommandContext, ComponentContext } from './command-framework.js';
 
 // ─── Types ───────────────────────────────────────────────────────────
 export type {
