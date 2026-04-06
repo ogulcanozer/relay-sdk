@@ -126,8 +126,12 @@ export class RESTClient {
     });
   }
 
-  async editMessage(messageId: string, content: string): Promise<void> {
-    await this.post('message.edit', { messageId, content });
+  async editMessage(messageId: string, content: string, opts?: { components?: ActionRow[] | null }): Promise<void> {
+    await this.post('message.edit', {
+      messageId,
+      content,
+      ...(opts?.components !== undefined ? { components: opts.components } : {}),
+    });
   }
 
   async deleteMessage(messageId: string): Promise<void> {

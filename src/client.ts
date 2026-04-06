@@ -244,9 +244,9 @@ export class BotClient extends TypedEmitter<ClientEvents> {
     return this.rest.sendMessage(channelId, content, opts);
   }
 
-  /** Edit a message by ID. */
-  async editMessage(messageId: string, content: string): Promise<void> {
-    return this.rest.editMessage(messageId, content);
+  /** Edit a message by ID. Pass components: null to remove all components. */
+  async editMessage(messageId: string, content: string, opts?: { components?: ActionRow[] | null }): Promise<void> {
+    return this.rest.editMessage(messageId, content, opts);
   }
 
   /** Delete a message by ID. */
