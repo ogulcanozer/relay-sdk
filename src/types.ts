@@ -127,6 +127,7 @@ export interface VoiceReadyPayload {
 }
 
 export interface BotVoiceTransportCreatedPayload {
+  transportId: string;
   direction: 'send' | 'recv';
   ip: string;
   port: number;

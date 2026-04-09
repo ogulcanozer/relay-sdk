@@ -69,6 +69,15 @@ export class VoiceConnection {
   private sendInterval: ReturnType<typeof setInterval> | null = null;
   private sendQueue: Buffer[] = [];
 
+  // mediasoup-rust requires a complete, spec-compliant RtpParameters payload
+  // (header_extensions / encodings / rtcp are non-optional in the Rust struct —
+  // mediasoup-js was lenient and defaulted them, the Rust port is strict).
+  // These are the pieces we need to assemble that payload and keep the
+  // RtpSender's SSRC in sync with rtpParameters.encodings[0].ssrc.
+  private routerRtpCapabilities: unknown = null;
+  private sendTransportId: string | null = null;
+  private sendSsrc: number | null = null;
+
   // Consumers — producerId → userId
   private consumers = new Map<string, string>();
 
@@ -163,6 +172,11 @@ export class VoiceConnection {
 
   handleVoiceReady(data: VoiceReadyPayload): void {
     this.voiceSessionId = data.voiceSessionId;
+    // Echoed back on every VoiceConsume — the Rust signaling server requires
+    // a spec-compliant RtpCapabilities payload on consume (codecs +
+    // headerExtensions, neither optional). The router's capabilities are the
+    // safe universal value: "I accept anything the router accepts".
+    this.routerRtpCapabilities = data.routerRtpCapabilities;
 
     // Set E2EE keys
     if (data.e2ee) {
@@ -182,27 +196,69 @@ export class VoiceConnection {
 
   handleTransportCreated(data: BotVoiceTransportCreatedPayload): void {
     if (data.direction === 'send') {
+      this.sendTransportId = data.transportId;
       this.sendAddr = { ip: data.ip, port: data.port };
       this.sendSocket = dgram.createSocket('udp4');
 
-      // Request produce (bot sends Opus audio)
-      this.gateway.sendVoiceProduce('', 'audio', {
-        codecs: [{ mimeType: 'audio/opus', payloadType: 111, clockRate: 48000, channels: 1 }],
-      });
-      this.debug(`Send transport created: ${data.ip}:${data.port}`);
+      // Generate the SSRC up-front so rtpParameters.encodings[0].ssrc and the
+      // RtpSender we'll create in handleProduceReady share the same value.
+      // mediasoup routes incoming RTP packets to the producer by SSRC, so a
+      // mismatch here means the SFU drops every frame we send.
+      //
+      // Pick from the range 1..=0x7fffffff so we stay safely inside u32 after
+      // `>>> 0` rounding and never collide with SSRC 0 (which some stacks
+      // treat as "unset").
+      this.sendSsrc = (Math.floor(Math.random() * 0x7fffffff) + 1) >>> 0;
+
+      // Build the full rtpParameters payload the Rust signaling server
+      // requires. Required fields per `mediasoup-types::RtpParameters`:
+      //   - codecs        — non-empty
+      //   - headerExtensions — non-optional; empty array is fine here
+      //   - encodings     — at least one entry; must carry ssrc or rid
+      //   - rtcp          — non-optional; reducedSize must be set
+      // mediasoup-js silently defaulted the missing ones; mediasoup-rust
+      // rejects the produce with `invalid RtpParameters JSON`.
+      const rtpParameters = {
+        codecs: [
+          {
+            mimeType: 'audio/opus',
+            payloadType: 111,
+            clockRate: 48000,
+            channels: 1,
+          },
+        ],
+        headerExtensions: [],
+        encodings: [
+          {
+            ssrc: this.sendSsrc,
+            dtx: true,
+          },
+        ],
+        rtcp: {
+          cname: `relay-bot-${this.sendSsrc}`,
+          reducedSize: true,
+        },
+      };
+
+      this.gateway.sendVoiceProduce(data.transportId, 'audio', rtpParameters);
+      this.debug(
+        `Send transport created: ${data.ip}:${data.port} (id ${data.transportId}, ssrc ${this.sendSsrc})`,
+      );
     } else {
       this.recvAddr = { ip: data.ip, port: data.port };
       this.setupRecvSocket(data.ip, data.port);
-      this.debug(`Recv transport created: ${data.ip}:${data.port}`);
+      this.debug(`Recv transport created: ${data.ip}:${data.port} (id ${data.transportId})`);
     }
   }
 
   handleProduceReady(data: VoiceProduceReadyPayload): void {
-    if (!this.sendSocket || !this.sendAddr) return;
+    if (!this.sendSocket || !this.sendAddr || this.sendSsrc == null) return;
 
-    // RTP sender with standard Opus payload type
+    // RTP sender reusing the SSRC we declared in rtpParameters.encodings[0].
+    // Must match or mediasoup-rust will drop incoming packets as belonging to
+    // an unknown SSRC.
     this.rtpSender = new RtpSender(
-      Math.floor(Math.random() * 0xffffffff),
+      this.sendSsrc,
       111, // Opus payload type
       48000,
     );
@@ -245,8 +301,10 @@ export class VoiceConnection {
   // ─── Internal ────────────────────────────────────────────────────
 
   private consumeProducer(producerId: string, userId: string): void {
-    // Only consume mic audio (not video/screen)
-    this.gateway.sendVoiceConsume(producerId);
+    // Only consume mic audio (not video/screen).
+    // rtpCapabilities is required by the Rust signaling server — pass back
+    // the router's own capabilities as a universal "accept anything" value.
+    this.gateway.sendVoiceConsume(producerId, this.routerRtpCapabilities);
     this.consumers.set(producerId, userId);
     this.debug(`Consuming producer ${producerId} from ${userId}`);
   }
@@ -322,6 +380,9 @@ export class VoiceConnection {
     this.sendAddr = null;
     this.recvAddr = null;
     this.rtpSender = null;
+    this.sendTransportId = null;
+    this.sendSsrc = null;
+    this.routerRtpCapabilities = null;
     this.consumers.clear();
     this.e2ee.destroy();
     this._ready = false;
