@@ -140,16 +140,34 @@ export interface VoiceProduceReadyPayload {
   producerType?: string;
 }
 
+/**
+ * Dispatched in response to a successful VOICE_CONSUME. Mirrors the JSON
+ * the Rust signaling server builds in
+ * `crates/signaling-server/src/media/voice_handler.rs` around line 1322.
+ *
+ * The ip/port/rtcpPort fields that older SDK revisions declared here are
+ * NOT dispatched by the server — incoming RTP always lands on the bot's
+ * recv PlainTransport socket (set up from the BOT_VOICE_TRANSPORT_CREATED
+ * dispatch for `direction: 'recv'`).
+ *
+ * `rtpParameters` is the consumer's negotiated parameters as produced by
+ * `mediasoup::Consumer::rtp_parameters()`. Its `encodings[0].ssrc` is the
+ * SSRC the bot should filter incoming RTP packets on to route them to the
+ * correct userId / E2EE key.
+ */
 export interface VoiceConsumerCreatedPayload {
   consumerId: string;
   producerId: string;
-  kind: string;
+  kind: 'audio' | 'video';
   producerType?: string;
-  userId?: string;
-  ip: string;
-  port: number;
-  rtcpPort?: number;
-  rtpParameters: unknown;
+  userId?: string | null;
+  rtpParameters: {
+    codecs: Array<{ payloadType: number; [key: string]: unknown }>;
+    encodings: Array<{ ssrc?: number; [key: string]: unknown }>;
+    headerExtensions?: unknown[];
+    rtcp?: Record<string, unknown>;
+    [key: string]: unknown;
+  };
 }
 
 export interface NewProducerPayload {

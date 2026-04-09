@@ -1,8 +1,19 @@
 /**
  * Opus encoder/decoder wrapper using @discordjs/opus (optional peer dependency).
  *
- * All audio is 48kHz mono, 20ms frames = 960 samples.
- * Opus is the mandatory codec for Relay voice (same as WebRTC/Discord).
+ * 48kHz STEREO, 20ms frames.
+ *
+ * The mediasoup router on the Rust signaling server is pinned to Opus@2ch
+ * (see `crates/signaling-server/src/media/workers.rs:240`). mediasoup-rust's
+ * codec matcher at `mediasoup-0.20.0/src/ortc.rs:1055` does strict equality
+ * on the `channels` field — a mono producer is rejected as "Unsupported
+ * codec". Bots therefore encode and decode stereo Opus, and feed stereo
+ * interleaved Int16LE PCM to `encodeOpus`.
+ *
+ * Frame math:
+ *   48000 Hz × 0.020 s = 960 samples per channel per 20ms frame
+ *   960 samples × 2 channels = 1920 interleaved samples per frame
+ *   1920 samples × 2 bytes   = 3840 bytes per frame (Int16LE)
  */
 
 interface OpusEncoderInstance {
@@ -11,14 +22,21 @@ interface OpusEncoderInstance {
 }
 
 const SAMPLE_RATE = 48000;
-const CHANNELS = 1;
+const CHANNELS = 2;
 const FRAME_DURATION_MS = 20;
 
-/** Number of PCM samples per 20ms frame at 48kHz mono */
-export const FRAME_SIZE = (SAMPLE_RATE * FRAME_DURATION_MS) / 1000; // 960
+/** Number of PCM samples per 20ms frame PER CHANNEL at 48kHz. */
+export const FRAME_SAMPLES_PER_CHANNEL = (SAMPLE_RATE * FRAME_DURATION_MS) / 1000; // 960
 
-/** Size of one frame in bytes (Int16LE = 2 bytes per sample) */
-export const FRAME_BYTES = FRAME_SIZE * 2; // 1920
+/**
+ * Legacy alias — kept for back-compat with existing bot code. Has the same
+ * value as `FRAME_SAMPLES_PER_CHANNEL` because that was the meaning in the
+ * mono-only v1 of this module.
+ */
+export const FRAME_SIZE = FRAME_SAMPLES_PER_CHANNEL;
+
+/** Size of one 20ms frame in bytes (Int16LE, stereo interleaved). */
+export const FRAME_BYTES = FRAME_SAMPLES_PER_CHANNEL * CHANNELS * 2; // 3840
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let OpusEncoderCtor: new (rate: number, channels: number) => OpusEncoderInstance;
@@ -53,12 +71,15 @@ function getEncoder(): OpusEncoderInstance {
   return encoder;
 }
 
-/** Decode an Opus frame to PCM Int16LE buffer. */
+/** Decode an Opus frame to PCM Int16LE buffer (stereo interleaved, 3840 bytes). */
 export function decodeOpus(opusFrame: Buffer): Buffer {
   return getEncoder().decode(opusFrame);
 }
 
-/** Encode a PCM Int16LE buffer (960 samples) to an Opus frame. */
+/**
+ * Encode a PCM Int16LE stereo-interleaved buffer (3840 bytes, 960 frames per
+ * channel) to an Opus frame.
+ */
 export function encodeOpus(pcm: Buffer): Buffer {
   return getEncoder().encode(pcm);
 }

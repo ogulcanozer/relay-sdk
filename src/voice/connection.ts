@@ -1,30 +1,100 @@
 /**
- * VoiceConnection — manages a bot's voice session in a channel.
+ * VoiceConnection — manages a bot's voice session against the Relay
+ * Rust signaling server.
  *
- * Lifecycle:
- *   1. joinVoice(channelId, serverId) — tRPC call + WS voice state
- *   2. VOICE_READY → request send + recv PlainTransports
- *   3. BOT_VOICE_TRANSPORT_CREATED → open UDP sockets
- *   4. VOICE_PRODUCE_READY → send dummy RTP (comedia), start send loop
- *   5. NEW_PRODUCER / VOICE_CONSUMER_CREATED → receive RTP, decrypt, decode
- *   6. leave() → close sockets, clean up
+ * The wire contract lives in the Rust crate
+ * `crates/signaling-server/src/media/voice_handler.rs`. Every decision in
+ * this file flows from a strict reading of that file plus the mediasoup
+ * router configuration at `crates/signaling-server/src/media/workers.rs`.
  *
- * E2EE: Epoch secrets arrive in VOICE_READY.e2ee and E2EE_KEY_UPDATE.
- * Incoming Opus frames are decrypted before decode.
- * Outgoing frames are NOT encrypted (PlainTransport = raw RTP, no Encoded Transform).
- * This matches the architecture: only WebRTC clients encrypt via RTCRtpScriptTransform.
+ * ## The handshake, in order
  *
- * Wait — if clients encrypt, bots must decrypt or they hear nothing. ✓ (E2EEKeyManager handles this)
- * But bots can't encrypt via PlainTransport. The SFU forwards bot's unencrypted RTP to clients.
- * Clients' decryptors will fail on these frames and pass them through (garbled/silent).
+ * The Rust server imposes a strict ordering on bot voice setup. Each step
+ * MUST complete before the next begins or the room state machine rejects
+ * the request (or, worse, silently drops it).
  *
- * TODO: For full E2EE compatibility, bots need to encrypt outgoing frames too.
- * This requires: encryptOpus(frame) → [TOC | ciphertext | tag] before RTP packing.
+ *   ┌─ client ─────────────────────────┬─ server ─────────────────────┐
+ *   │                                   │                              │
+ *   │ 1. REST joinVoiceChannel          │                              │
+ *   │ 2. WS VOICE_STATE {action:'join'} │                              │
+ *   │                                   │ ↪ creates room membership,  │
+ *   │                                   │   rotates E2EE epoch,        │
+ *   │                                   │   dispatches VOICE_READY     │
+ *   │                                   │                              │
+ *   │ 3. cache routerRtpCapabilities,   │                              │
+ *   │    E2EE keys, existingProducers.  │                              │
+ *   │    WS BOT_VOICE_TRANSPORT {send}  │                              │
+ *   │                                   │ ↪ creates PlainTransport    │
+ *   │                                   │   (comedia=true), dispatches │
+ *   │                                   │   BOT_VOICE_TRANSPORT_CREATED│
+ *   │                                   │                              │
+ *   │ 4. open send UDP socket,          │                              │
+ *   │    generate SSRC,                 │                              │
+ *   │    WS VOICE_PRODUCE {...}         │                              │
+ *   │                                   │ ↪ creates mediasoup Producer,│
+ *   │                                   │   dispatches                 │
+ *   │                                   │   VOICE_PRODUCE_READY +      │
+ *   │                                   │   fans NEW_PRODUCER to room  │
+ *   │                                   │                              │
+ *   │ 5. create RtpSender,              │                              │
+ *   │    punch NAT (comedia),           │                              │
+ *   │    WS BOT_VOICE_TRANSPORT {recv}  │                              │
+ *   │                                   │ ↪ creates recv PlainTransport│
+ *   │                                   │   dispatches                 │
+ *   │                                   │   BOT_VOICE_TRANSPORT_CREATED│
+ *   │                                   │                              │
+ *   │ 6. open recv UDP socket,          │                              │
+ *   │    punch NAT, mark ready,         │                              │
+ *   │    drain existingProducers queue, │                              │
+ *   │    WS VOICE_CONSUME {...} for each│                              │
+ *   │                                   │ ↪ creates mediasoup Consumers│
+ *   │                                   │   dispatches                 │
+ *   │                                   │   VOICE_CONSUMER_CREATED each│
+ *   └───────────────────────────────────┴──────────────────────────────┘
+ *
+ * ## Why the order matters
+ *
+ * - **recv transport must exist before VOICE_CONSUME.** Rust's
+ *   `handle_voice_consume` at voice_handler.rs:1259 bails with
+ *   `"no recv transport for consume"` when the recv transport is `None`.
+ *   Consuming the `existingProducers` list from VOICE_READY before the
+ *   recv transport is ready floods the log and produces no audio.
+ *
+ * - **SSRC must match.** Rust's mediasoup matches producer's
+ *   `rtpParameters.encodings[0].ssrc` against the actual RTP stream's
+ *   header SSRC. They're generated once up-front in step 4 and shared
+ *   with the RtpSender in step 5.
+ *
+ * - **Codec must be Opus@2ch.** The router at `workers.rs:240` declares
+ *   Opus with `channels: 2`. `mediasoup-0.20.0/src/ortc.rs:1055` rejects
+ *   any producer whose codec channels differ. See `opus.ts` — the bot
+ *   encodes stereo end-to-end.
+ *
+ * ## E2EE
+ *
+ * Incoming RTP frames are decrypted via per-sender AES-128-GCM keys
+ * derived from the epoch secret the server sends in VOICE_READY.e2ee /
+ * E2EE_KEY_UPDATE. See `e2ee.ts`.
+ *
+ * Outgoing frames are NOT encrypted. PlainTransport skips RTCRtpScriptTransform
+ * so there is no Encoded Transform path on the bot side. The SFU forwards
+ * the bot's cleartext Opus frames to browser consumers. Browser clients
+ * will attempt to decrypt them, fail, and pass them through their
+ * decryptor (see `packages/client/src/lib/audio/e2ee-manager.ts`). This
+ * matches how the Node bot SDK behaved — a known limitation tracked for
+ * a future SDK release.
+ *
+ * ## SSRC → userId routing
+ *
+ * When a VOICE_CONSUMER_CREATED dispatch arrives the bot records the
+ * consumer's SSRC (from `rtpParameters.encodings[0].ssrc`) alongside the
+ * producer's `userId`. Incoming RTP packets are routed directly by SSRC —
+ * no per-packet scan over every known sender's decryptor.
  */
 
 import * as dgram from 'node:dgram';
-import { parseRtpPacket, RtpSender, type RtpPacket } from './rtp.js';
-import { decodeOpus, encodeOpus, initOpus, pcmToInt16, FRAME_SIZE, FRAME_BYTES } from './opus.js';
+import { parseRtpPacket, RtpSender } from './rtp.js';
+import { decodeOpus, encodeOpus, initOpus, pcmToInt16 } from './opus.js';
 import { E2EEKeyManager } from './e2ee.js';
 import type { Gateway } from '../gateway.js';
 import type { RESTClient } from '../rest.js';
@@ -40,6 +110,20 @@ import type {
 
 type DebugFn = (message: string) => void;
 
+/**
+ * Lifecycle states of the voice connection. Every handler asserts on the
+ * current state and transitions it atomically. This mirrors how the Rust
+ * side tracks the room's per-participant state machine.
+ */
+type State =
+  | 'idle' // no join() in flight
+  | 'joining' // sent VOICE_STATE join, waiting for VOICE_READY
+  | 'readySentXportReq' // got VOICE_READY, requested send transport
+  | 'sendXportReady' // got send transport, sent VOICE_PRODUCE
+  | 'producing' // got VOICE_PRODUCE_READY, requested recv transport
+  | 'ready' // got recv transport — full duplex audio active
+  | 'leaving'; // in destroy()
+
 export interface VoiceEvents {
   /** Fired when an incoming RTP packet is decoded to PCM. */
   audioReceive: (userId: string, pcm: Int16Array) => void;
@@ -49,48 +133,87 @@ export interface VoiceEvents {
   destroyed: () => void;
 }
 
+/** Opus RTP payload type for our router — must match workers.rs `preferred_payload_type: Some(111)`. */
+const OPUS_PAYLOAD_TYPE = 111;
+/** Opus RTP clock rate — must match workers.rs `clock_rate: 48000`. */
+const OPUS_CLOCK_RATE = 48000;
+/** Opus channels — must match workers.rs `channels: 2`. */
+const OPUS_CHANNELS = 2;
+
 export class VoiceConnection {
   private gateway: Gateway;
   private rest: RESTClient;
   private debug: DebugFn;
 
+  // ─── Lifecycle ──────────────────────────────────────────────────
+  private state: State = 'idle';
   private channelId: string | null = null;
   private serverId: string | null = null;
   private voiceSessionId: string | null = null;
 
-  // UDP sockets
-  private sendSocket: dgram.Socket | null = null;
-  private recvSocket: dgram.Socket | null = null;
-  private sendAddr: { ip: string; port: number } | null = null;
-  private recvAddr: { ip: string; port: number } | null = null;
-
-  // RTP
-  private rtpSender: RtpSender | null = null;
-  private sendInterval: ReturnType<typeof setInterval> | null = null;
-  private sendQueue: Buffer[] = [];
-
-  // mediasoup-rust requires a complete, spec-compliant RtpParameters payload
-  // (header_extensions / encodings / rtcp are non-optional in the Rust struct —
-  // mediasoup-js was lenient and defaulted them, the Rust port is strict).
-  // These are the pieces we need to assemble that payload and keep the
-  // RtpSender's SSRC in sync with rtpParameters.encodings[0].ssrc.
+  /**
+   * Router RtpCapabilities captured from VOICE_READY and echoed back on
+   * every VOICE_CONSUME. The server's `router.can_consume(...)` check
+   * does strict ORTC matching, so sending the router's own capabilities
+   * is the universal "accept anything" value — we don't need to build a
+   * bot-specific subset.
+   */
   private routerRtpCapabilities: unknown = null;
+
+  // ─── Produce (send) path ────────────────────────────────────────
+  private sendSocket: dgram.Socket | null = null;
+  private sendAddr: { ip: string; port: number } | null = null;
   private sendTransportId: string | null = null;
+  /**
+   * The SSRC declared in `rtpParameters.encodings[0].ssrc` and reused
+   * verbatim by the outbound RtpSender. Must be generated once before
+   * VOICE_PRODUCE and held stable for the entire producing session.
+   */
   private sendSsrc: number | null = null;
+  private rtpSender: RtpSender | null = null;
 
-  // Consumers — producerId → userId
-  private consumers = new Map<string, string>();
+  // ─── Consume (recv) path ────────────────────────────────────────
+  private recvSocket: dgram.Socket | null = null;
+  private recvAddr: { ip: string; port: number } | null = null;
+  private recvTransportId: string | null = null;
 
-  // E2EE
+  /**
+   * Producers discovered in VOICE_READY.existingProducers before the recv
+   * transport is ready. Consuming them any earlier would trip Rust's
+   * `no recv transport for consume` guard in voice_handler.rs:1263.
+   * Flushed once inside `handleTransportCreated('recv', …)`.
+   */
+  private pendingProducers: Array<{ producerId: string; userId: string }> = [];
+
+  /**
+   * Producers that have been asked to consume but haven't yet gotten a
+   * VOICE_CONSUMER_CREATED dispatch back. Used only for debug clarity —
+   * the authoritative SSRC→userId mapping is `ssrcToUser` below.
+   */
+  private pendingConsumes = new Map<string, string>(); // producerId → userId
+
+  /**
+   * SSRC → userId index, populated on VOICE_CONSUMER_CREATED from the
+   * consumer's `rtpParameters.encodings[0].ssrc`. Used to route incoming
+   * RTP packets to the correct E2EE decryptor in O(1).
+   */
+  private ssrcToUser = new Map<number, string>();
+
+  /**
+   * producerId → SSRC back-index so we can clean up `ssrcToUser` when
+   * PRODUCER_CLOSED arrives (payload carries producerId, not ssrc).
+   */
+  private producerToSsrc = new Map<string, number>();
+
+  /** E2EE decryptor pool (one per sender userId). */
   private e2ee = new E2EEKeyManager();
 
-  // Callbacks
+  // ─── Callbacks ──────────────────────────────────────────────────
   private onAudioReceive: ((userId: string, pcm: Int16Array) => void) | null = null;
   private onReady: (() => void) | null = null;
   private onDestroyed: (() => void) | null = null;
 
-  // State
-  private _ready = false;
+  // ─── One-time init flags ────────────────────────────────────────
   private opusInitialized = false;
 
   constructor(gateway: Gateway, rest: RESTClient, debug: DebugFn) {
@@ -99,213 +222,349 @@ export class VoiceConnection {
     this.debug = debug;
   }
 
-  get ready(): boolean { return this._ready; }
+  get ready(): boolean {
+    return this.state === 'ready';
+  }
 
   /** Register voice event handlers. */
   on<K extends keyof VoiceEvents>(event: K, handler: VoiceEvents[K]): this {
     switch (event) {
-      case 'audioReceive': this.onAudioReceive = handler as VoiceEvents['audioReceive']; break;
-      case 'ready': this.onReady = handler as VoiceEvents['ready']; break;
-      case 'destroyed': this.onDestroyed = handler as VoiceEvents['destroyed']; break;
+      case 'audioReceive':
+        this.onAudioReceive = handler as VoiceEvents['audioReceive'];
+        break;
+      case 'ready':
+        this.onReady = handler as VoiceEvents['ready'];
+        break;
+      case 'destroyed':
+        this.onDestroyed = handler as VoiceEvents['destroyed'];
+        break;
     }
     return this;
   }
 
-  /** Join a voice channel. Returns when the voice pipeline is ready. */
+  // ─── Public API ─────────────────────────────────────────────────
+
+  /**
+   * Join a voice channel. Resolves once the REST call + WS join frame
+   * have been sent — the full voice pipeline readiness is signalled later
+   * via the `ready` event.
+   */
   async join(channelId: string, serverId: string): Promise<void> {
+    if (this.state !== 'idle') {
+      this.debug(`join() called in state ${this.state} — ignoring`);
+      return;
+    }
+
     this.channelId = channelId;
     this.serverId = serverId;
+    this.state = 'joining';
 
-    // Initialize Opus if not already done
     if (!this.opusInitialized) {
       await initOpus();
       this.opusInitialized = true;
     }
 
-    // Phase 1: tRPC call to register in DB
+    // Phase 1: REST → DB membership
     await this.rest.joinVoiceChannel(channelId, serverId);
 
-    // Phase 2: WS voice state join → triggers VOICE_READY
+    // Phase 2: WS voice state join → triggers VOICE_READY on the server
     this.gateway.sendVoiceState('join', channelId, serverId);
     this.debug(`Joining voice channel ${channelId} in server ${serverId}`);
   }
 
-  /** Leave the current voice channel. */
+  /** Leave the current voice channel. Best-effort; never throws. */
   async leave(): Promise<void> {
     this.gateway.sendVoiceState('leave');
     try {
       await this.rest.leaveVoiceChannel();
     } catch {
-      // Best-effort
+      // Best-effort — REST leave is a hint, the WS leave is authoritative.
     }
     this.destroy();
   }
 
   /**
-   * Queue PCM audio for sending. Each call should be one 20ms frame (960 samples).
-   * Opus encodes and RTP packs automatically.
+   * Queue a PCM audio frame for sending. Each call must be exactly one
+   * 20ms stereo-interleaved Int16LE frame (3840 bytes, 960 frames per
+   * channel). See `opus.ts` for the frame layout.
    */
   sendAudio(pcm: Buffer): void {
-    if (!this.rtpSender || !this.sendSocket || !this.sendAddr) return;
-
+    if (!this.canSend()) return;
     try {
       const opus = encodeOpus(pcm);
-      const packet = this.rtpSender.pack(opus);
-      this.sendSocket.send(packet, this.sendAddr.port, this.sendAddr.ip);
+      this.sendRtp(opus);
     } catch (err) {
       this.debug(`Send audio error: ${err}`);
     }
   }
 
   /**
-   * Queue an already-encoded Opus frame for sending.
-   * Use this when streaming pre-encoded audio (e.g., from ffmpeg).
+   * Queue an already-encoded Opus frame for sending. Use this when
+   * streaming pre-encoded audio straight from ffmpeg's libopus output.
    */
   sendOpus(opusFrame: Buffer): void {
-    if (!this.rtpSender || !this.sendSocket || !this.sendAddr) return;
-
-    const packet = this.rtpSender.pack(opusFrame);
-    this.sendSocket.send(packet, this.sendAddr.port, this.sendAddr.ip);
+    if (!this.canSend()) return;
+    this.sendRtp(opusFrame);
   }
 
-  // ─── Gateway Event Handlers (called by BotClient) ────────────────
+  private canSend(): boolean {
+    return (
+      this.state === 'ready' &&
+      this.rtpSender !== null &&
+      this.sendSocket !== null &&
+      this.sendAddr !== null
+    );
+  }
 
+  private sendRtp(opusFrame: Buffer): void {
+    // canSend() guards all four fields — the non-null assertions below
+    // are safe for the whole method.
+    const packet = this.rtpSender!.pack(opusFrame);
+    this.sendSocket!.send(packet, this.sendAddr!.port, this.sendAddr!.ip);
+  }
+
+  // ─── Gateway Event Handlers (wired by BotClient) ────────────────
+
+  /**
+   * VOICE_READY — the server has created our room membership and is
+   * ready for the transport setup dance.
+   */
   handleVoiceReady(data: VoiceReadyPayload): void {
+    if (this.state !== 'joining') {
+      this.debug(`VOICE_READY in state ${this.state} — ignoring`);
+      return;
+    }
+
     this.voiceSessionId = data.voiceSessionId;
-    // Echoed back on every VoiceConsume — the Rust signaling server requires
-    // a spec-compliant RtpCapabilities payload on consume (codecs +
-    // headerExtensions, neither optional). The router's capabilities are the
-    // safe universal value: "I accept anything the router accepts".
+
+    // Cache the router's RtpCapabilities — every VOICE_CONSUME echoes
+    // this verbatim so the server's `router.can_consume(...)` check
+    // always sees the full superset. See `consumeProducer` below.
     this.routerRtpCapabilities = data.routerRtpCapabilities;
 
-    // Set E2EE keys
+    // E2EE keys (optional — the server omits this if E2EE is disabled).
     if (data.e2ee) {
       this.e2ee.setKeys(data.e2ee.epochSecret);
       this.debug(`E2EE keys set (epoch ${data.e2ee.epoch})`);
     }
 
-    // Request send transport
-    this.gateway.sendBotVoiceTransport('send');
-    this.debug('VOICE_READY — requesting send transport');
+    // Stash the existingProducers list — we'll consume them once the
+    // recv transport is ready. Consuming now would trip Rust's
+    // `no recv transport for consume` guard.
+    this.pendingProducers = data.existingProducers.map((p) => ({
+      producerId: p.producerId,
+      userId: p.userId,
+    }));
 
-    // Consume existing producers
-    for (const p of data.existingProducers) {
+    this.state = 'readySentXportReq';
+    this.gateway.sendBotVoiceTransport('send');
+    this.debug(
+      `VOICE_READY — requesting send transport (${this.pendingProducers.length} existing producers queued)`,
+    );
+  }
+
+  /**
+   * BOT_VOICE_TRANSPORT_CREATED — the server has allocated a
+   * PlainTransport for us and told us where to send/receive RTP.
+   */
+  handleTransportCreated(data: BotVoiceTransportCreatedPayload): void {
+    if (data.direction === 'send') {
+      this.handleSendTransportCreated(data);
+    } else {
+      this.handleRecvTransportCreated(data);
+    }
+  }
+
+  private handleSendTransportCreated(data: BotVoiceTransportCreatedPayload): void {
+    if (this.state !== 'readySentXportReq') {
+      this.debug(`send transport created in state ${this.state} — ignoring`);
+      return;
+    }
+
+    this.sendTransportId = data.transportId;
+    this.sendAddr = { ip: data.ip, port: data.port };
+    this.sendSocket = dgram.createSocket('udp4');
+
+    // Pre-generate the SSRC so rtpParameters.encodings[0].ssrc and the
+    // RtpSender created in handleProduceReady share the same value.
+    // mediasoup-rust drops any RTP packet whose header SSRC doesn't match
+    // the producer's declared SSRC.
+    //
+    // Range 1..=0x7fffffff stays safely inside u32 and avoids SSRC 0
+    // (which some stacks treat as unset).
+    this.sendSsrc = (Math.floor(Math.random() * 0x7fffffff) + 1) >>> 0;
+
+    // Build the full rtpParameters payload. Required fields per
+    // `mediasoup-types::RtpParameters`: codecs, encodings, rtcp —
+    // headerExtensions is strictly required by the deserializer (no
+    // `#[serde(default)]`) but an empty array is accepted.
+    //
+    // Codec matches the router spec at workers.rs:237-246 byte for byte.
+    // mediasoup-rust's `match_codecs` at ortc.rs:1055 is strict on mime,
+    // clock rate, channels (does NOT check audio parameters for plain
+    // Opus — only for MultiChannelOpus — but we still send the router's
+    // recommended parameters for bitstream quality).
+    const rtpParameters = {
+      codecs: [
+        {
+          mimeType: 'audio/opus',
+          payloadType: OPUS_PAYLOAD_TYPE,
+          clockRate: OPUS_CLOCK_RATE,
+          channels: OPUS_CHANNELS,
+          parameters: {
+            minptime: 10,
+            useinbandfec: 1,
+            usedtx: 1,
+          },
+          rtcpFeedback: [],
+        },
+      ],
+      headerExtensions: [],
+      encodings: [
+        {
+          ssrc: this.sendSsrc,
+          dtx: true,
+        },
+      ],
+      rtcp: {
+        cname: `relay-bot-${this.sendSsrc}`,
+        reducedSize: true,
+      },
+    };
+
+    this.state = 'sendXportReady';
+    this.gateway.sendVoiceProduce(data.transportId, 'audio', rtpParameters);
+    this.debug(
+      `Send transport created ${data.ip}:${data.port} (id ${data.transportId}, ssrc ${this.sendSsrc})`,
+    );
+  }
+
+  private handleRecvTransportCreated(data: BotVoiceTransportCreatedPayload): void {
+    if (this.state !== 'producing') {
+      this.debug(`recv transport created in state ${this.state} — ignoring`);
+      return;
+    }
+
+    this.recvTransportId = data.transportId;
+    this.recvAddr = { ip: data.ip, port: data.port };
+    this.setupRecvSocket(data.ip, data.port);
+    this.state = 'ready';
+
+    this.onReady?.();
+    this.debug(
+      `Recv transport created ${data.ip}:${data.port} (id ${data.transportId}) — voice connection fully ready`,
+    );
+
+    // NOW it's safe to consume the producers we stashed from VOICE_READY.
+    const pending = this.pendingProducers;
+    this.pendingProducers = [];
+    for (const p of pending) {
       this.consumeProducer(p.producerId, p.userId);
     }
   }
 
-  handleTransportCreated(data: BotVoiceTransportCreatedPayload): void {
-    if (data.direction === 'send') {
-      this.sendTransportId = data.transportId;
-      this.sendAddr = { ip: data.ip, port: data.port };
-      this.sendSocket = dgram.createSocket('udp4');
+  /**
+   * VOICE_PRODUCE_READY — our producer is live. Create the RtpSender
+   * (reusing the SSRC we declared in rtpParameters) and request the
+   * recv transport for the consume side.
+   */
+  handleProduceReady(data: VoiceProduceReadyPayload): void {
+    if (this.state !== 'sendXportReady') {
+      this.debug(`VOICE_PRODUCE_READY in state ${this.state} — ignoring`);
+      return;
+    }
+    if (this.sendSsrc == null || !this.sendSocket || !this.sendAddr) {
+      this.debug('VOICE_PRODUCE_READY without send socket/ssrc — inconsistent state');
+      return;
+    }
 
-      // Generate the SSRC up-front so rtpParameters.encodings[0].ssrc and the
-      // RtpSender we'll create in handleProduceReady share the same value.
-      // mediasoup routes incoming RTP packets to the producer by SSRC, so a
-      // mismatch here means the SFU drops every frame we send.
-      //
-      // Pick from the range 1..=0x7fffffff so we stay safely inside u32 after
-      // `>>> 0` rounding and never collide with SSRC 0 (which some stacks
-      // treat as "unset").
-      this.sendSsrc = (Math.floor(Math.random() * 0x7fffffff) + 1) >>> 0;
+    this.rtpSender = new RtpSender(this.sendSsrc, OPUS_PAYLOAD_TYPE, OPUS_CLOCK_RATE);
 
-      // Build the full rtpParameters payload the Rust signaling server
-      // requires. Required fields per `mediasoup-types::RtpParameters`:
-      //   - codecs        — non-empty
-      //   - headerExtensions — non-optional; empty array is fine here
-      //   - encodings     — at least one entry; must carry ssrc or rid
-      //   - rtcp          — non-optional; reducedSize must be set
-      // mediasoup-js silently defaulted the missing ones; mediasoup-rust
-      // rejects the produce with `invalid RtpParameters JSON`.
-      const rtpParameters = {
-        codecs: [
-          {
-            mimeType: 'audio/opus',
-            payloadType: 111,
-            clockRate: 48000,
-            channels: 1,
-          },
-        ],
-        headerExtensions: [],
-        encodings: [
-          {
-            ssrc: this.sendSsrc,
-            dtx: true,
-          },
-        ],
-        rtcp: {
-          cname: `relay-bot-${this.sendSsrc}`,
-          reducedSize: true,
-        },
-      };
+    // Punch the send PlainTransport. `comedia: true` means mediasoup
+    // learns our remote address from the first packet we send, so this
+    // dummy opens the addr/port binding without touching the Opus path.
+    const dummy = Buffer.alloc(12 + 3);
+    dummy[0] = 0x80;
+    dummy[1] = OPUS_PAYLOAD_TYPE;
+    this.sendSocket.send(dummy, this.sendAddr.port, this.sendAddr.ip);
 
-      this.gateway.sendVoiceProduce(data.transportId, 'audio', rtpParameters);
-      this.debug(
-        `Send transport created: ${data.ip}:${data.port} (id ${data.transportId}, ssrc ${this.sendSsrc})`,
-      );
+    this.state = 'producing';
+    this.gateway.sendBotVoiceTransport('recv');
+    this.debug(`Producer ready: ${data.producerId} — requesting recv transport`);
+  }
+
+  /**
+   * VOICE_CONSUMER_CREATED — one of our VOICE_CONSUME calls succeeded.
+   * Record the SSRC→userId mapping so `handleIncomingRtp` can route
+   * packets in O(1).
+   */
+  handleConsumerCreated(data: VoiceConsumerCreatedPayload): void {
+    const userId = data.userId ?? 'unknown';
+    const ssrc = data.rtpParameters?.encodings?.[0]?.ssrc;
+    if (typeof ssrc === 'number') {
+      this.ssrcToUser.set(ssrc, userId);
+      this.producerToSsrc.set(data.producerId, ssrc);
     } else {
-      this.recvAddr = { ip: data.ip, port: data.port };
-      this.setupRecvSocket(data.ip, data.port);
-      this.debug(`Recv transport created: ${data.ip}:${data.port} (id ${data.transportId})`);
+      this.debug(
+        `VOICE_CONSUMER_CREATED for producer ${data.producerId} carried no ssrc in rtpParameters`,
+      );
+    }
+    this.pendingConsumes.delete(data.producerId);
+    this.debug(`Consumer created for ${userId} (producer ${data.producerId}, ssrc ${ssrc})`);
+  }
+
+  /**
+   * NEW_PRODUCER — another participant just started producing. If we're
+   * fully ready we can consume immediately; otherwise buffer for the
+   * pendingProducers flush in `handleRecvTransportCreated`.
+   */
+  handleNewProducer(data: NewProducerPayload): void {
+    if (this.state === 'ready') {
+      this.consumeProducer(data.producerId, data.userId);
+    } else {
+      this.pendingProducers.push({ producerId: data.producerId, userId: data.userId });
+      this.debug(
+        `NEW_PRODUCER ${data.producerId} buffered — voice not yet ready (state=${this.state})`,
+      );
     }
   }
 
-  handleProduceReady(data: VoiceProduceReadyPayload): void {
-    if (!this.sendSocket || !this.sendAddr || this.sendSsrc == null) return;
-
-    // RTP sender reusing the SSRC we declared in rtpParameters.encodings[0].
-    // Must match or mediasoup-rust will drop incoming packets as belonging to
-    // an unknown SSRC.
-    this.rtpSender = new RtpSender(
-      this.sendSsrc,
-      111, // Opus payload type
-      48000,
-    );
-
-    // Send dummy packet to register address (comedia)
-    const dummy = Buffer.alloc(12 + 3);
-    dummy[0] = 0x80;
-    dummy[1] = 111;
-    this.sendSocket.send(dummy, this.sendAddr.port, this.sendAddr.ip);
-
-    // Request recv transport
-    this.gateway.sendBotVoiceTransport('recv');
-
-    this._ready = true;
-    this.onReady?.();
-    this.debug(`Producer ready: ${data.producerId} — voice connection fully ready`);
-  }
-
-  handleConsumerCreated(data: VoiceConsumerCreatedPayload): void {
-    const userId = data.userId ?? 'unknown';
-    this.consumers.set(data.producerId, userId);
-    this.debug(`Consumer created for ${userId} (producer ${data.producerId})`);
-  }
-
-  handleNewProducer(data: NewProducerPayload): void {
-    this.consumeProducer(data.producerId, data.userId);
-  }
-
+  /**
+   * PRODUCER_CLOSED — fan-out dispatch when a producer ends. Clean up
+   * the SSRC mapping and E2EE decryptor for that sender.
+   */
   handleProducerClosed(data: ProducerClosedPayload): void {
-    this.consumers.delete(data.producerId);
+    const ssrc = this.producerToSsrc.get(data.producerId);
+    if (ssrc != null) {
+      this.ssrcToUser.delete(ssrc);
+      this.producerToSsrc.delete(data.producerId);
+    }
+    this.pendingConsumes.delete(data.producerId);
     this.e2ee.removeSender(data.userId);
-    this.debug(`Producer closed: ${data.producerId} (${data.userId})`);
+    this.debug(`Producer closed: ${data.producerId} (${data.userId}, ssrc ${ssrc ?? 'unknown'})`);
   }
 
+  /** E2EE_KEY_UPDATE — epoch rotation after a room membership change. */
   handleE2EEKeyUpdate(data: E2EEKeyUpdatePayload): void {
     this.e2ee.updateKeys(data.epochSecret);
     this.debug(`E2EE keys updated (epoch ${data.epoch})`);
   }
 
-  // ─── Internal ────────────────────────────────────────────────────
+  // ─── Internal ───────────────────────────────────────────────────
 
   private consumeProducer(producerId: string, userId: string): void {
-    // Only consume mic audio (not video/screen).
-    // rtpCapabilities is required by the Rust signaling server — pass back
-    // the router's own capabilities as a universal "accept anything" value.
+    // The Rust VOICE_CONSUME handler fails with `no recv transport for
+    // consume` when called before the recv PlainTransport is ready. This
+    // method is only called either from `handleNewProducer` (gated on
+    // state==='ready') or from the `pendingProducers` flush in
+    // `handleRecvTransportCreated` (which also flips state to 'ready').
+    this.pendingConsumes.set(producerId, userId);
+    // Echo the router's capabilities verbatim — the server calls
+    // mediasoup's `router.can_consume(rtpCapabilities)` which does strict
+    // ORTC matching. The router's own capabilities are the universal
+    // "accept anything" value, and we don't need to construct a bot-side
+    // subset.
     this.gateway.sendVoiceConsume(producerId, this.routerRtpCapabilities);
-    this.consumers.set(producerId, userId);
     this.debug(`Consuming producer ${producerId} from ${userId}`);
   }
 
@@ -320,10 +579,11 @@ export class VoiceConnection {
       this.debug(`Recv socket error: ${err.message}`);
     });
 
-    // Send dummy to register (comedia)
+    // Punch the recv PlainTransport with a dummy packet (comedia — see
+    // the matching dummy send in handleProduceReady).
     const dummy = Buffer.alloc(12 + 3);
     dummy[0] = 0x80;
-    dummy[1] = 111;
+    dummy[1] = OPUS_PAYLOAD_TYPE;
     this.recvSocket.send(dummy, port, ip);
   }
 
@@ -331,33 +591,28 @@ export class VoiceConnection {
     const packet = parseRtpPacket(buf);
     if (!packet || packet.payload.length === 0) return;
 
-    // Find which user this packet belongs to (by SSRC → consumer map lookup)
-    // For now, try to match by iterating consumers (simplified — production would use SSRC mapping)
-    // The userId is resolved from the consumer map when VOICE_CONSUMER_CREATED arrives
-
-    let opusPayload = packet.payload;
-
-    // E2EE: try to decrypt if keys are set
-    // Each sender's frames are encrypted with their own key
-    // We try decryption for each known sender — the one that succeeds is the right one
-    // In practice, SSRC → userId mapping would be more efficient
-    for (const [, userId] of this.consumers) {
-      const decryptor = this.e2ee.getDecryptor(userId);
-      const decrypted = decryptor.decrypt(opusPayload);
-      if (decrypted) {
-        opusPayload = decrypted;
-        this.emitDecodedAudio(userId, opusPayload);
-        return;
-      }
+    // Route by SSRC directly. The consumer's SSRC was captured on
+    // VOICE_CONSUMER_CREATED and stored in ssrcToUser.
+    const userId = this.ssrcToUser.get(packet.header.ssrc);
+    if (!userId) {
+      // No mapping yet — either the consumer created dispatch hasn't
+      // arrived, or this is a stray packet from a producer we never
+      // consumed. Either way, drop.
+      return;
     }
 
-    // No E2EE or decryption not needed — decode directly
-    this.emitDecodedAudio('unknown', opusPayload);
+    // E2EE decrypt if we have a key for this sender. Frames sent by
+    // clients on the app side are AES-128-GCM encrypted; plain PCM from
+    // bot→bot (which shouldn't happen in current deployment) would come
+    // through with no encryption.
+    const decryptor = this.e2ee.getDecryptor(userId);
+    const decrypted = decryptor.decrypt(packet.payload) ?? packet.payload;
+
+    this.emitDecodedAudio(userId, decrypted);
   }
 
   private emitDecodedAudio(userId: string, opusPayload: Buffer): void {
     if (!this.onAudioReceive) return;
-
     try {
       const pcmBuf = decodeOpus(opusPayload);
       const pcm = pcmToInt16(pcmBuf);
@@ -368,24 +623,27 @@ export class VoiceConnection {
   }
 
   destroy(): void {
-    if (this.sendInterval) {
-      clearInterval(this.sendInterval);
-      this.sendInterval = null;
-    }
+    this.state = 'leaving';
 
     this.sendSocket?.close();
     this.sendSocket = null;
     this.recvSocket?.close();
     this.recvSocket = null;
+
     this.sendAddr = null;
     this.recvAddr = null;
-    this.rtpSender = null;
     this.sendTransportId = null;
+    this.recvTransportId = null;
     this.sendSsrc = null;
+    this.rtpSender = null;
+
+    this.pendingProducers = [];
+    this.pendingConsumes.clear();
+    this.ssrcToUser.clear();
+    this.producerToSsrc.clear();
+
     this.routerRtpCapabilities = null;
-    this.consumers.clear();
     this.e2ee.destroy();
-    this._ready = false;
 
     this.channelId = null;
     this.serverId = null;
@@ -393,5 +651,6 @@ export class VoiceConnection {
 
     this.onDestroyed?.();
     this.debug('Voice connection destroyed');
+    this.state = 'idle';
   }
 }
