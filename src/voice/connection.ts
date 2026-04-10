@@ -95,7 +95,7 @@
 import * as dgram from 'node:dgram';
 import { parseRtpPacket, RtpSender } from './rtp.js';
 import { decodeOpus, encodeOpus, initOpus, pcmToInt16 } from './opus.js';
-import { E2EEKeyManager } from './e2ee.js';
+import { E2EEKeyManager, E2EEEncryptor } from './e2ee.js';
 import type { Gateway } from '../gateway.js';
 import type { RESTClient } from '../rest.js';
 import type {
@@ -207,6 +207,12 @@ export class VoiceConnection {
 
   /** E2EE decryptor pool (one per sender userId). */
   private e2ee = new E2EEKeyManager();
+
+  /** E2EE encryptor for outgoing Opus frames. Initialized when keys
+   *  arrive via VOICE_READY. Without this, bot-produced frames go on
+   *  the wire cleartext and browser clients' decryptors fail-then-
+   *  passthrough — audible but not confidential. */
+  private encryptor: E2EEEncryptor | null = null;
 
   /**
    * Current speaking state, driven by [`setSpeaking`]. Survives WS
@@ -386,7 +392,15 @@ export class VoiceConnection {
   private sendRtp(opusFrame: Buffer): void {
     // canSend() guards all four fields — the non-null assertions below
     // are safe for the whole method.
-    const packet = this.rtpSender!.pack(opusFrame);
+    //
+    // E2EE: encrypt the Opus frame BEFORE RTP packing. The encryptor
+    // produces [TOC(1B) | ciphertext | tag(8B)] which the RTP sender
+    // wraps with the RTP header. Browser clients' RTCRtpScriptTransform
+    // decrypts after stripping the RTP header — same frame format.
+    // If the encryptor is not initialized (no keys yet), send cleartext
+    // as a fallback (matches historical behaviour).
+    const frame = this.encryptor?.encrypt(opusFrame) ?? opusFrame;
+    const packet = this.rtpSender!.pack(frame);
     this.sendSocket!.send(packet, this.sendAddr!.port, this.sendAddr!.ip);
   }
 
@@ -412,7 +426,15 @@ export class VoiceConnection {
     // E2EE keys (optional — the server omits this if E2EE is disabled).
     if (data.e2ee) {
       this.e2ee.setKeys(data.e2ee.epochSecret);
-      this.debug(`E2EE keys set (epoch ${data.e2ee.epoch})`);
+      // Initialize outgoing encryptor so bot-produced Opus frames are
+      // encrypted before RTP packing. Without this, browser clients'
+      // decryptors fail-then-passthrough (audible but not confidential).
+      const botUserId = this.gateway.userId;
+      if (botUserId) {
+        this.encryptor = new E2EEEncryptor(botUserId);
+        this.encryptor.init(data.e2ee.epochSecret);
+      }
+      this.debug(`E2EE keys set (epoch ${data.e2ee.epoch}), encryptor ${botUserId ? 'active' : 'skipped (no userId)'}`);
     }
 
     // Stash the existingProducers list — we'll consume them once the
@@ -631,6 +653,7 @@ export class VoiceConnection {
   /** E2EE_KEY_UPDATE — epoch rotation after a room membership change. */
   handleE2EEKeyUpdate(data: E2EEKeyUpdatePayload): void {
     this.e2ee.updateKeys(data.epochSecret);
+    this.encryptor?.updateKey(data.epochSecret);
     this.debug(`E2EE keys updated (epoch ${data.epoch})`);
   }
 
@@ -728,6 +751,8 @@ export class VoiceConnection {
 
     this.routerRtpCapabilities = null;
     this.e2ee.destroy();
+    this.encryptor?.destroy();
+    this.encryptor = null;
 
     this.channelId = null;
     this.serverId = null;

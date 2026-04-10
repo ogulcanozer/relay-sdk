@@ -13,7 +13,7 @@
  * Frame counter is monotonically increasing — never resets on epoch change.
  */
 
-import { createHash, createHmac, createDecipheriv } from 'node:crypto';
+import { createHash, createHmac, createCipheriv, createDecipheriv } from 'node:crypto';
 
 const UNENCRYPTED_BYTES = 1;
 const GCM_TAG_LENGTH = 8;
@@ -84,6 +84,78 @@ export class E2EEDecryptor {
 
     // Reconstruct: [header | plaintext]
     return Buffer.concat([header, plaintext]);
+  }
+}
+
+// ─── Outgoing Encryption ────────────────────────────────────────────
+
+/**
+ * Per-bot outgoing E2EE encryptor. Mirrors the client's
+ * `createEncryptionContext` from `packages/client/src/lib/e2ee/crypto.ts`.
+ *
+ * Frame format matches the decrypt side exactly:
+ *   output = [TOC byte (1B) | AES-128-GCM ciphertext | GCM tag (8B)]
+ *   AAD    = TOC byte
+ *   IV     = SHA256(senderId)[:4] + frameCounter(BE64) = 12 bytes
+ *
+ * Frame counter is monotonically increasing — never resets on epoch
+ * change. Since the key changes with each epoch, (key, IV) uniqueness
+ * is maintained.
+ */
+export class E2EEEncryptor {
+  private key: Buffer | null = null;
+  private senderHash: Buffer;
+  private frameCounter = 0;
+  private initialized = false;
+
+  constructor(private readonly senderId: string) {
+    this.senderHash = hashSenderId(senderId);
+  }
+
+  /** Initialize with epoch secret from VOICE_READY. */
+  init(epochSecret: string): void {
+    this.key = deriveKey(epochSecret, this.senderId);
+    this.frameCounter = 0;
+    this.initialized = true;
+  }
+
+  /** Update key on epoch rotation (E2EE_KEY_UPDATE). */
+  updateKey(newSecret: string): void {
+    this.key = deriveKey(newSecret, this.senderId);
+    // Frame counter is NOT reset — monotonically increasing
+  }
+
+  /** Clear all key material. */
+  destroy(): void {
+    if (this.key) { this.key.fill(0); this.key = null; }
+    this.initialized = false;
+    this.frameCounter = 0;
+  }
+
+  /**
+   * Encrypt an Opus frame for E2EE transmission.
+   * Returns the encrypted frame: [TOC(1B) | ciphertext | tag(8B)].
+   * Returns null if the encryptor is not initialized.
+   */
+  encrypt(frame: Buffer): Buffer | null {
+    if (!this.initialized || !this.key) return null;
+    if (frame.length < UNENCRYPTED_BYTES + 1) return null; // at least TOC + 1 byte payload
+
+    const header = frame.subarray(0, UNENCRYPTED_BYTES);
+    const payload = frame.subarray(UNENCRYPTED_BYTES);
+    const iv = buildIV(this.senderHash, this.frameCounter++);
+
+    try {
+      const cipher = createCipheriv('aes-128-gcm', this.key, iv, { authTagLength: GCM_TAG_LENGTH });
+      cipher.setAAD(header);
+      const ciphertext = Buffer.concat([cipher.update(payload), cipher.final()]);
+      const tag = cipher.getAuthTag();
+
+      // [header | ciphertext | tag(8B)]
+      return Buffer.concat([header, ciphertext, tag]);
+    } catch {
+      return null;
+    }
   }
 }
 
