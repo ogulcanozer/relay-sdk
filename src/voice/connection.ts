@@ -208,6 +208,17 @@ export class VoiceConnection {
   /** E2EE decryptor pool (one per sender userId). */
   private e2ee = new E2EEKeyManager();
 
+  /**
+   * Current speaking state, driven by [`setSpeaking`]. Survives WS
+   * reconnects so [`handleVoiceReady`] can re-emit the op when a new
+   * voice session starts — without this, a bot that was mid-track
+   * when the WS dropped would have a permanently-dark speaking ring
+   * on every browser client until the next pause/resume/stop call,
+   * which could be the entire length of the current song. See
+   * Phase 7 of `docs/audit/2026-04-09-audio-voice-race-audit.md`.
+   */
+  private speakingState = false;
+
   // ─── Callbacks ──────────────────────────────────────────────────
   private onAudioReceive: ((userId: string, pcm: Int16Array) => void) | null = null;
   private onReady: (() => void) | null = null;
@@ -274,6 +285,11 @@ export class VoiceConnection {
 
   /** Leave the current voice channel. Best-effort; never throws. */
   async leave(): Promise<void> {
+    // Flush any dangling speaking state before the leave op so the
+    // fan-out order is (speaking_stop → leave) not (leave → stale
+    // speaking bit on the client's atom for the torn-down
+    // participant). setSpeaking is a no-op if we weren't speaking.
+    this.setSpeaking(false);
     this.gateway.sendVoiceState('leave');
     try {
       await this.rest.leaveVoiceChannel();
@@ -281,6 +297,57 @@ export class VoiceConnection {
       // Best-effort — REST leave is a hint, the WS leave is authoritative.
     }
     this.destroy();
+  }
+
+  /**
+   * Update the bot's speaking state. Idempotent — repeated calls with
+   * the same value are dropped. Emits `VOICE_STATE:speaking_start` /
+   * `speaking_stop` to the signaling server, which fans out
+   * `VOICE_STATE_UPDATE` to every other participant so their client
+   * UIs can light / dim the glow ring around the bot's avatar.
+   *
+   * ## Usage pattern
+   *
+   * Call this from the bot's playback state machine at every point
+   * audio starts or stops flowing. For a music bot, that's:
+   *
+   *   - `setSpeaking(true)` when a track starts playing (or resumes
+   *     from pause).
+   *   - `setSpeaking(false)` on pause, stop, skip-to-empty-queue,
+   *     destroy, or any other silence transition.
+   *
+   * Continuous-playback bots should NOT drive this from a heartbeat
+   * on `sendOpus` calls — the state-machine approach has zero latency
+   * on transitions, no polling overhead, and is resilient to brief
+   * silence gaps within a track (FFmpeg buffer drains, etc.) that
+   * would otherwise flicker the ring off and on.
+   *
+   * ## Reconnect resilience
+   *
+   * The state is cached in the VoiceConnection and re-emitted
+   * automatically from `handleVoiceReady` on every fresh VOICE_READY
+   * dispatch. So if the WS drops mid-track and the bot rejoins
+   * voice, the glow ring will light back up as soon as the new
+   * voice session starts — the bot code doesn't need to retry the
+   * call itself. This closes a hole that existed in the historical
+   * music bot (pre-SDK split) which had no reconnect handling.
+   *
+   * @param value — `true` when audio starts flowing, `false` when it
+   *                stops. No-ops if the connection is `idle` or
+   *                `leaving`, or if the value matches the current
+   *                cached state.
+   */
+  setSpeaking(value: boolean): void {
+    if (this.speakingState === value) return;
+    if (this.state === 'idle' || this.state === 'leaving') return;
+    this.speakingState = value;
+    if (this.channelId == null || this.serverId == null) return;
+    this.gateway.sendVoiceState(
+      value ? 'speaking_start' : 'speaking_stop',
+      this.channelId,
+      this.serverId,
+    );
+    this.debug(`setSpeaking(${value}) — emitted op`);
   }
 
   /**
@@ -361,6 +428,23 @@ export class VoiceConnection {
     this.debug(
       `VOICE_READY — requesting send transport (${this.pendingProducers.length} existing producers queued)`,
     );
+
+    // Phase 7 — reconnect resilience. If we were speaking before the
+    // WS dropped, re-emit the speaking_start op now that a fresh
+    // voice session is live. This is idempotent against the server's
+    // `handle_speaking` cache write (which sets the same value the
+    // bot already thinks it has) and cost-free on first-join (the
+    // temporary `cached = false; setSpeaking(false)` path is a
+    // no-op on the idempotency guard).
+    //
+    // We temporarily clear `speakingState` so `setSpeaking` will
+    // actually fire the op — the idempotency guard would otherwise
+    // see "already true" and skip. The alternative (bypassing the
+    // helper) would duplicate the gateway call logic.
+    if (this.speakingState) {
+      this.speakingState = false;
+      this.setSpeaking(true);
+    }
   }
 
   /**
@@ -648,6 +732,10 @@ export class VoiceConnection {
     this.channelId = null;
     this.serverId = null;
     this.voiceSessionId = null;
+    // Reset speaking state — next join() starts from a clean slate.
+    // Any caller that wants to persist speaking across a full
+    // teardown/rejoin should track that intent themselves.
+    this.speakingState = false;
 
     this.onDestroyed?.();
     this.debug('Voice connection destroyed');
