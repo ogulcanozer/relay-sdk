@@ -1,16 +1,19 @@
 /**
- * E2EE frame decryption for bots — DAVE protocol (AES-128-GCM).
+ * E2EE frame encryption/decryption for bots — DAVE protocol (AES-128-GCM).
  *
  * Bots receive encrypted Opus frames from the SFU via RTP. The server
  * distributes epoch secrets in VOICE_READY and E2EE_KEY_UPDATE events.
- * This module decrypts incoming frames so bots can decode the Opus audio.
  *
- * Frame format: [TOC byte (1B) | ciphertext | GCM tag (8B)]
+ * Wire format: [TOC byte (1B) | ciphertext + GCM tag (8B) | counter (4B)]
+ *
+ * The 4-byte truncated frame counter is appended in the clear so the
+ * receiver can reconstruct the IV without maintaining an independent
+ * counter. This eliminates counter desync on late consumer starts or
+ * packet loss.
+ *
  * Key derivation: HKDF-SHA256(secret, salt="relay-e2ee-v1", info="sender:{id}")
- * IV: SHA256(senderId)[:4] + frameCounter(BE64) = 12 bytes
+ * IV: SHA256(senderId)[:4] + counter(BE64, upper 4 bytes zero) = 12 bytes
  * Tag: 8 bytes (native tagLength: 64)
- *
- * Frame counter is monotonically increasing — never resets on epoch change.
  */
 
 import { createHash, createHmac, createCipheriv, createDecipheriv } from 'node:crypto';
@@ -19,13 +22,13 @@ const UNENCRYPTED_BYTES = 1;
 const GCM_TAG_LENGTH = 8;
 const IV_LENGTH = 12;
 const KEY_LENGTH = 16; // AES-128
+const COUNTER_BYTES = 4; // Truncated counter appended to each frame
 
 /** Per-sender decryption state. */
 export class E2EEDecryptor {
   private key: Buffer | null = null;
   private prevKey: Buffer | null = null;
   private senderHash: Buffer; // 4 bytes
-  private frameCounter = 0;
   private initialized = false;
 
   constructor(private readonly senderId: string) {
@@ -36,7 +39,6 @@ export class E2EEDecryptor {
   init(epochSecret: string): void {
     this.key = deriveKey(epochSecret, this.senderId);
     this.prevKey = null;
-    this.frameCounter = 0;
     this.initialized = true;
   }
 
@@ -44,7 +46,6 @@ export class E2EEDecryptor {
   updateKeys(newSecret: string): void {
     this.prevKey = this.key;
     this.key = deriveKey(newSecret, this.senderId);
-    // Frame counter is NOT reset — monotonically increasing
   }
 
   /** Clear all key material. */
@@ -52,25 +53,29 @@ export class E2EEDecryptor {
     if (this.key) { this.key.fill(0); this.key = null; }
     if (this.prevKey) { this.prevKey.fill(0); this.prevKey = null; }
     this.initialized = false;
-    this.frameCounter = 0;
   }
 
   /**
-   * Decrypt an E2EE Opus frame in-place.
+   * Decrypt an E2EE Opus frame.
+   * Reads the 4-byte counter from the frame tail to reconstruct the IV.
    * Returns decrypted frame (TOC + plaintext) or null on auth failure.
    */
   decrypt(frame: Buffer): Buffer | null {
     if (!this.initialized || !this.key) return null;
 
-    // Minimum: header(1) + at least 1 byte ciphertext + tag(8) = 10
-    if (frame.length < UNENCRYPTED_BYTES + 1 + GCM_TAG_LENGTH) return null;
+    // Minimum: header(1) + at least 1 byte ciphertext + tag(8) + counter(4) = 14
+    if (frame.length < UNENCRYPTED_BYTES + 1 + GCM_TAG_LENGTH + COUNTER_BYTES) return null;
+
+    // Read the 4-byte counter from the frame tail
+    const counter = frame.readUInt32BE(frame.length - COUNTER_BYTES);
 
     const header = frame.subarray(0, UNENCRYPTED_BYTES);
-    const ciphertextWithTag = frame.subarray(UNENCRYPTED_BYTES);
+    // Everything between header and counter is ciphertext + tag
+    const ciphertextWithTag = frame.subarray(UNENCRYPTED_BYTES, frame.length - COUNTER_BYTES);
     const ciphertext = ciphertextWithTag.subarray(0, ciphertextWithTag.length - GCM_TAG_LENGTH);
     const tag = ciphertextWithTag.subarray(ciphertextWithTag.length - GCM_TAG_LENGTH);
 
-    const iv = buildIV(this.senderHash, this.frameCounter++);
+    const iv = buildIV(this.senderHash, counter);
 
     // Try current key
     let plaintext = tryDecrypt(this.key, iv, header, ciphertext, tag);
@@ -93,14 +98,14 @@ export class E2EEDecryptor {
  * Per-bot outgoing E2EE encryptor. Mirrors the client's
  * `createEncryptionContext` from `packages/client/src/lib/e2ee/crypto.ts`.
  *
- * Frame format matches the decrypt side exactly:
- *   output = [TOC byte (1B) | AES-128-GCM ciphertext | GCM tag (8B)]
+ * Wire format:
+ *   output = [TOC byte (1B) | AES-128-GCM ciphertext + GCM tag (8B) | counter (4B)]
  *   AAD    = TOC byte
- *   IV     = SHA256(senderId)[:4] + frameCounter(BE64) = 12 bytes
+ *   IV     = SHA256(senderId)[:4] + counter(BE64, upper 4 zero) = 12 bytes
  *
  * Frame counter is monotonically increasing — never resets on epoch
- * change. Since the key changes with each epoch, (key, IV) uniqueness
- * is maintained.
+ * change (updateKey preserves it). Since the key changes with each
+ * epoch, (key, IV) uniqueness is maintained.
  */
 export class E2EEEncryptor {
   private key: Buffer | null = null;
@@ -119,7 +124,7 @@ export class E2EEEncryptor {
     this.initialized = true;
   }
 
-  /** Update key on epoch rotation (E2EE_KEY_UPDATE). */
+  /** Update key on epoch rotation (E2EE_KEY_UPDATE). Counter preserved. */
   updateKey(newSecret: string): void {
     this.key = deriveKey(newSecret, this.senderId);
     // Frame counter is NOT reset — monotonically increasing
@@ -134,7 +139,7 @@ export class E2EEEncryptor {
 
   /**
    * Encrypt an Opus frame for E2EE transmission.
-   * Returns the encrypted frame: [TOC(1B) | ciphertext | tag(8B)].
+   * Returns the encrypted frame: [TOC(1B) | ciphertext + tag(8B) | counter(4B)].
    * Returns null if the encryptor is not initialized.
    */
   encrypt(frame: Buffer): Buffer | null {
@@ -143,7 +148,8 @@ export class E2EEEncryptor {
 
     const header = frame.subarray(0, UNENCRYPTED_BYTES);
     const payload = frame.subarray(UNENCRYPTED_BYTES);
-    const iv = buildIV(this.senderHash, this.frameCounter++);
+    const currentCounter = this.frameCounter++;
+    const iv = buildIV(this.senderHash, currentCounter);
 
     try {
       const cipher = createCipheriv('aes-128-gcm', this.key, iv, { authTagLength: GCM_TAG_LENGTH });
@@ -151,8 +157,12 @@ export class E2EEEncryptor {
       const ciphertext = Buffer.concat([cipher.update(payload), cipher.final()]);
       const tag = cipher.getAuthTag();
 
-      // [header | ciphertext | tag(8B)]
-      return Buffer.concat([header, ciphertext, tag]);
+      // Write 4-byte big-endian counter
+      const counterBuf = Buffer.alloc(COUNTER_BYTES);
+      counterBuf.writeUInt32BE(currentCounter >>> 0, 0);
+
+      // [header | ciphertext | tag(8B) | counter(4B)]
+      return Buffer.concat([header, ciphertext, tag, counterBuf]);
     } catch {
       return null;
     }
@@ -246,12 +256,15 @@ function deriveKey(epochSecret: string, senderId: string): Buffer {
   return t1.subarray(0, KEY_LENGTH);
 }
 
-function buildIV(senderHash: Buffer, frameCounter: number): Buffer {
+/** Build 12-byte IV: senderHash[4] + counter(BE64, upper 4 bytes zero)[8].
+ *  Upper 4 bytes always zero — wire counter is 4 bytes (uint32). */
+function buildIV(senderHash: Buffer, counter: number): Buffer {
   const iv = Buffer.alloc(IV_LENGTH);
   senderHash.copy(iv, 0, 0, 4);
-  // Big-endian uint64
-  iv.writeUInt32BE(Math.floor(frameCounter / 0x100000000), 4);
-  iv.writeUInt32BE(frameCounter >>> 0, 8);
+  // Upper 32 bits always zero (wire counter is 4 bytes)
+  iv.writeUInt32BE(0, 4);
+  // Lower 32 bits: the wire counter
+  iv.writeUInt32BE(counter >>> 0, 8);
   return iv;
 }
 
