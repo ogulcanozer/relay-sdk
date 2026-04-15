@@ -98,6 +98,23 @@ import { decodeOpus, encodeOpus, initOpus, pcmToInt16 } from './opus.js';
 import { E2EEKeyManager, E2EEEncryptor } from './e2ee.js';
 import type { Gateway } from '../gateway.js';
 import type { RESTClient } from '../rest.js';
+
+/**
+ * Maximum E2EE protocol version THIS SDK supports. Bumped in lockstep
+ * with the `E2EEEncryptor` implementation here — current v1 is the
+ * AES-128-GCM frame encryption with HKDF-derived per-sender keys,
+ * matching the web client. Declared on every voice join so the server
+ * can negotiate `min(participants)` across the room.
+ *
+ * Kept as a local const rather than importing from `@relay/shared`
+ * because this SDK is a separately-published package and mustn't
+ * take a workspace-peer dependency on the main client's shared
+ * constants crate. If the numbering drifts between the two, the
+ * `V0_TRANSPORT_ONLY` / `V1_FRAME` comment in
+ * `crates/signaling-server/src/e2ee/protocol.rs` is the canonical
+ * reference.
+ */
+const E2EE_PROTOCOL_VERSION = 1;
 import type {
   VoiceReadyPayload,
   BotVoiceTransportCreatedPayload,
@@ -284,8 +301,14 @@ export class VoiceConnection {
     // Phase 1: REST → DB membership
     await this.rest.joinVoiceChannel(channelId, serverId);
 
-    // Phase 2: WS voice state join → triggers VOICE_READY on the server
-    this.gateway.sendVoiceState('join', channelId, serverId);
+    // Phase 2: WS voice state join → triggers VOICE_READY on the server.
+    // Advertise this SDK's max E2EE protocol version (v1 — frame E2EE
+    // via `E2EEEncryptor`). Server negotiates the room's active
+    // version as `min(all participants)`; if a v0-only device (current
+    // iOS) is present, the whole room drops to transport-only and the
+    // server's VOICE_READY response carries `e2ee: null`, at which
+    // point `handleVoiceReady` below skips E2EEManager setup entirely.
+    this.gateway.sendVoiceState('join', channelId, serverId, E2EE_PROTOCOL_VERSION);
     this.debug(`Joining voice channel ${channelId} in server ${serverId}`);
   }
 

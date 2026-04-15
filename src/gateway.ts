@@ -100,9 +100,28 @@ export class Gateway {
     }
   }
 
-  /** Send a voice state update. */
-  sendVoiceState(action: string, channelId?: string, serverId?: string): void {
-    this.send({ op: Op.VOICE_STATE, d: { action, channelId, serverId } });
+  /**
+   * Send a voice state update.
+   *
+   * `e2eeProtocolVersion` declares the bot's maximum supported E2EE
+   * protocol version — bots ship the same AES-128-GCM frame encryptor
+   * as the web/Electron clients, so this is `1` (frame E2EE). The
+   * server computes `min(versions)` across participants; a bot joining
+   * a channel with a v0-only device (current iOS) drops the whole room
+   * to transport-only. Send only on the `join` action — other actions
+   * (`leave`, `speaking_start`, `speaking_stop`) don't need it.
+   */
+  sendVoiceState(
+    action: string,
+    channelId?: string,
+    serverId?: string,
+    e2eeProtocolVersion?: number,
+  ): void {
+    const d: Record<string, unknown> = { action, channelId, serverId };
+    if (action === 'join' && e2eeProtocolVersion !== undefined) {
+      d.e2eeProtocolVersion = e2eeProtocolVersion;
+    }
+    this.send({ op: Op.VOICE_STATE, d });
   }
 
   /** Send an interaction response. */

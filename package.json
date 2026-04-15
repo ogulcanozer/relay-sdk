@@ -1,6 +1,6 @@
 {
   "name": "@relay/sdk",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Relay Bot SDK — typed client for building Relay bots",
   "type": "module",
   "main": "dist/index.js",
