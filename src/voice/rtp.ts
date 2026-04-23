@@ -83,6 +83,7 @@ export function buildRtpPacket(header: RtpHeader, payload: Buffer): Buffer {
 export class RtpSender {
   private sequenceNumber: number;
   private timestamp: number;
+  private lastPackWallMs: number | null = null;
 
   constructor(
     public readonly ssrc: number,
@@ -93,8 +94,38 @@ export class RtpSender {
     this.timestamp = Math.floor(Math.random() * 0xffffffff);
   }
 
-  /** Create an RTP packet, advancing sequence and timestamp automatically. */
+  /**
+   * Create an RTP packet, advancing sequence and timestamp automatically.
+   *
+   * Steady streaming: timestamp advances by exactly one frame
+   * (`clockRate * frameDurationMs / 1000`) per pack — e.g. +960 at
+   * 48kHz/20ms. When the sender has been dormant (gap between calls
+   * > 2.5 × frameDurationMs, i.e. ~50ms at 20ms frames), the timestamp
+   * fast-forwards to match the wall-clock gap so the resumed packet's
+   * timestamp reflects real elapsed time. Without this, an intermittent
+   * producer (bot that only sends while echoing utterances) emits
+   * packets whose timestamps imply they should play back-to-back even
+   * though they arrive seconds apart — receivers' NetEq reads that as
+   * extreme jitter and inflates the target buffer depth by the dormancy
+   * window, delaying playback by that same amount. The SFU eventually
+   * times out the producer.
+   */
   pack(opusFrame: Buffer, frameDurationMs = 20): Buffer {
+    const frameSamples = Math.floor((this.clockRate * frameDurationMs) / 1000);
+    const now = Date.now();
+
+    if (this.lastPackWallMs !== null) {
+      const gapMs = now - this.lastPackWallMs;
+      if (gapMs > frameDurationMs * 2.5) {
+        // Dormant. Fast-forward timestamp to match wall-clock, leaving
+        // one frame so the end-of-pack increment below keeps cadence.
+        const skipMs = gapMs - frameDurationMs;
+        const skipSamples = Math.floor((this.clockRate * skipMs) / 1000);
+        this.timestamp = (this.timestamp + skipSamples) >>> 0;
+      }
+    }
+    this.lastPackWallMs = now;
+
     const header: RtpHeader = {
       payloadType: this.payloadType,
       sequenceNumber: this.sequenceNumber,
@@ -106,7 +137,7 @@ export class RtpSender {
     const packet = buildRtpPacket(header, opusFrame);
 
     this.sequenceNumber = (this.sequenceNumber + 1) & 0xffff;
-    this.timestamp = (this.timestamp + (this.clockRate * frameDurationMs) / 1000) >>> 0;
+    this.timestamp = (this.timestamp + frameSamples) >>> 0;
 
     return packet;
   }
